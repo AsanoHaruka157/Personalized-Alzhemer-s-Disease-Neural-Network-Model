@@ -31,6 +31,7 @@ for pid, sample in csf_dict.items():
 
 import torch.nn as nn
 
+# 下面的层曾经在调试中用过，目前看可能没什么用
 class NegativeTanh(nn.Module):
     def forward(self, x):
         return -torch.tanh(x)
@@ -183,7 +184,7 @@ def fit_population(
         patient_data,
         n_adam      = 200,      # adam 阶段迭代次数
         n_lbfgs    = 0,     # lbfgs 阶段迭代次数
-        adam_lr_w    = 1e-2,
+        adam_lr_w    = 5e-3,
         adam_lr_ab   = 5e-3,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
