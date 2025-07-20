@@ -90,7 +90,7 @@ def calculate_sequential_loss(model, dat, ab_pid_theta, sigma=None):
     y_actuals = torch.stack(y_actuals)
     
     # Calculate Mean Squared Error for this patient
-    loss = (y_preds - y_actuals)**2
+    loss = torch.exp(abs(y_preds - y_actuals))**2
     if sigma is not None:
         loss = loss / sigma
     
@@ -115,7 +115,7 @@ def calculate_global_loss(model, dat, ab_pid_theta, sigma=None):
     y_pred_trajectory = model(s, y0)
     y_actual_trajectory = dat['y']
     
-    loss = (y_pred_trajectory - y_actual_trajectory)**2
+    loss = torch.exp(abs(y_pred_trajectory - y_actual_trajectory))**2
     if sigma is not None:
         loss = loss / sigma
         
