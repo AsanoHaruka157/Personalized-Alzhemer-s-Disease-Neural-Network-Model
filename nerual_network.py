@@ -96,6 +96,39 @@ def calculate_sequential_loss(model, dat, ab_pid_theta, sigma=None):
     return loss.mean()
 
 
+def calculate_global_loss(model, dat, ab_pid_theta, sigma=None):
+    """
+    Calculates the loss based on the global trajectory from y0.
+    """
+    num_steps = dat['t'].shape[0]
+    if num_steps < 2:
+        device = next(model.parameters()).device
+        return torch.tensor(0.0, device=device)
+
+    alpha = torch.exp(ab_pid_theta[0]) + 1e-4
+    beta  = ab_pid_theta[1]
+    s = alpha * dat['t'] + beta
+    
+    y0 = dat['y'][0]
+    
+    y_pred_trajectory = model(s, y0)
+    y_actual_trajectory = dat['y']
+    
+    loss = (y_pred_trajectory - y_actual_trajectory)**2
+    if sigma is not None:
+        loss = loss / sigma
+        
+    return loss.mean()
+
+def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None):
+    """
+    Calculates a combined loss: 50% sequential and 50% global.
+    """
+    loss_seq = calculate_sequential_loss(model, dat, ab_pid_theta, sigma)
+    loss_global = calculate_global_loss(model, dat, ab_pid_theta, sigma)
+    return 0.5 * loss_seq + 0.5 * loss_global
+
+
 import torch, torch.nn as nn, torch.optim as optim
 import torch.nn.functional as F
 from math import ceil
@@ -104,13 +137,19 @@ def fit_population(
         patient_data,
         n_adam      = 220,      # adam 阶段迭代次数
         n_lbfgs    = 80,     # lbfgs 阶段迭代次数
-        adam_lr_w    = 5e-2,    # Adjusted learning rate for the neural network
-        adam_lr_ab   = 1e-2,
+        adam_lr_w    = 5e-3,    # Adjusted learning rate for the neural network
+        adam_lr_ab   = 5e-3,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
         max_lbfgs_it = 10,
         tolerance_grad = 0,
         tolerance_change = 0):
+    
+    # ---------- 计算每个生物标记物的全局方差以调整权重 ----------
+    all_biomarkers = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
+    sigma = all_biomarkers.var(dim=0)
+    # 加上一个很小的数防止除以零
+    sigma = sigma.clamp_min(1e-8)
 
     # ---------- 初始化 ----------
     model = PopulationODE()
@@ -167,7 +206,7 @@ def fit_population(
             opt_w_adam.zero_grad()
             loss_w = 0.
             for pid, dat in patient_data.items():
-                loss_w += calculate_sequential_loss(model, dat, ab[pid]['theta'])
+                loss_w += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
             
             if torch.isnan(loss_w):
                 print(f"Iter {it+1:02d}: Adam loss for w is NaN. Stopping training.")
@@ -187,7 +226,7 @@ def fit_population(
                 opt_w.zero_grad()
                 loss = 0.
                 for pid, dat in patient_data.items():
-                    loss += calculate_sequential_loss(model, dat, ab[pid]['theta'])
+                    loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
                 if not torch.isnan(loss):
                     loss.backward()
                 return loss
@@ -231,7 +270,7 @@ def fit_population(
         for pid, dat in patient_data.items():
             if use_adam:
                 opt_ab_adam[pid].zero_grad()
-                loss_ab = calculate_sequential_loss(model, dat, ab[pid]['theta'], sigma)
+                loss_ab = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
 
                 if torch.isnan(loss_ab):
                     print(f"Iter {it+1:02d}: Adam loss for α,β for pid {pid} is NaN. Stopping training.")
@@ -248,7 +287,7 @@ def fit_population(
 
                 def closure_ab():
                     opt_ab.zero_grad()
-                    loss = calculate_sequential_loss(model, dat, ab[pid]['theta'], sigma)
+                    loss = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
                     if not torch.isnan(loss):
                         loss.backward()
                     return loss
@@ -269,7 +308,7 @@ def fit_population(
                 num_patients = 0
                 for pid, dat in patient_data.items():
                     if dat['t'].shape[0] >= 2:
-                         total_loss += calculate_sequential_loss(model, dat, ab[pid]['theta'])
+                         total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'])
                          num_patients += 1
                 
                 mean_loss = total_loss / num_patients if num_patients > 0 else 0.
