@@ -49,7 +49,7 @@ class PopulationODE(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.sigmoid(),
+            nn.Sigmoid(),
             nn.Linear(hidden_dim, 4)
         )
 
@@ -211,6 +211,13 @@ def fit_population(
                 nn.init.constant_(m.bias, 0)
     model.apply(weights_init)
     
+    # Accelerate model with JIT compilation
+    try:
+        model = torch.jit.script(model)
+        print("Model successfully compiled with JIT.")
+    except Exception as e:
+        print(f"JIT compilation failed: {e}. Running in eager mode.")
+
     stage_dict = pc.load_stage_dict()
     ab = {}
     for pid, dat in patient_data.items():
@@ -398,8 +405,10 @@ def fit_population(
 
 model_fix, ab_dict = fit_population(
     patient_data,)
+
 current_pid = os.getpid()
-torch.save(model_fix, f'model_{current_pid}.pt')
+# Use the .save() method for JIT-scripted models
+model_fix.save(f'model_{current_pid}.pt')
 
 # ---------- 2. 绘制人群四联图 (根据s的5%和95%分位数) -----------------
 # -------- 计算所有s值并确定分位数 ---------
@@ -488,7 +497,7 @@ for k, ax in enumerate(axes.flat):
 
 fig2.suptitle(f'Population biomarker trajectories (s in [{s_min.item():.2f}, {s_max.item():.2f}])')
 plt.tight_layout(rect=[0,0,1,0.96])
-plt.savefig('nn.png')
+plt.savefig(f'result_{current_pid}.png')
 
 # ---------- 为 alpha vs. MSE 散点图计算最终 MSE ----------
 final_mses = {}
@@ -524,5 +533,5 @@ ax_alpha_mse.set_ylabel('Final MSE')
 ax_alpha_mse.set_title('Alpha vs. Final MSE for each patient')
 ax_alpha_mse.grid(True)
 plt.tight_layout()
-plt.savefig('alpha_mse_scatter.png')
+plt.savefig(f'alpha_mse_{current_pid}.png')
 plt.show()
