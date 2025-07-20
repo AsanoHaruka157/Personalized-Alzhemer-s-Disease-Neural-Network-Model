@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn.functional as F
 import pccmnn as pc
+import os
 
 # ------------------ 你已有的部分 ------------------
 csf_dict = pc.load_csf_data()
@@ -120,13 +121,22 @@ def calculate_global_loss(model, dat, ab_pid_theta, sigma=None):
         
     return loss.mean()
 
-def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None):
+def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None, reg_lambda=0.0):
     """
     Calculates a combined loss: 50% sequential and 50% global.
+    Includes an optional regularization term for alpha.
     """
     loss_seq = calculate_sequential_loss(model, dat, ab_pid_theta, sigma)
     loss_global = calculate_global_loss(model, dat, ab_pid_theta, sigma)
-    return 0.5 * loss_seq + 0.5 * loss_global
+    
+    combined_loss = 0.5 * loss_seq + 0.5 * loss_global
+    
+    if reg_lambda > 0:
+        alpha = torch.exp(ab_pid_theta[0]) + 1e-4
+        alpha_reg_loss = reg_lambda * (alpha - 1)**2
+        combined_loss += alpha_reg_loss
+        
+    return combined_loss
 
 
 import torch, torch.nn as nn, torch.optim as optim
@@ -135,15 +145,16 @@ from math import ceil
 
 def fit_population(
         patient_data,
-        n_adam      = 220,      # adam 阶段迭代次数
-        n_lbfgs    = 80,     # lbfgs 阶段迭代次数
+        n_adam      = 200,      # adam 阶段迭代次数
+        n_lbfgs    = 0,     # lbfgs 阶段迭代次数
         adam_lr_w    = 5e-3,    # Adjusted learning rate for the neural network
         adam_lr_ab   = 5e-3,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
         max_lbfgs_it = 10,
         tolerance_grad = 0,
-        tolerance_change = 0):
+        tolerance_change = 0,
+        reg_lambda_alpha=1e-2):
     
     # ---------- 计算每个生物标记物的全局方差以调整权重 ----------
     all_biomarkers = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
@@ -191,10 +202,21 @@ def fit_population(
         ab[pid] = {'theta': torch.tensor([theta0.item(), theta1.item()], requires_grad=True)}
 
     # --------- Adam 优化器池 -----------
-    opt_w_adam  = optim.Adam(model.parameters(), lr=adam_lr_w)
-    opt_ab_adam = {pid: optim.Adam([ab[pid]['theta']], lr=adam_lr_ab)
+    opt_w_adam  = optim.Adam(model.parameters(), lr=adam_lr_w, weight_decay=1e-4)
+    opt_ab_adam = {pid: optim.Adam([ab[pid]['theta']], lr=adam_lr_ab, weight_decay=1e-4)
                    for pid in ab}
     scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=[100], gamma=0.5, last_epoch=-1)
+    opt_w_lbfgs = optim.LBFGS(model.parameters(), 
+                    lr=lbfgs_lr_w,
+                    max_iter=max_lbfgs_it, 
+                    tolerance_grad=tolerance_grad, 
+                    tolerance_change=tolerance_change)
+    opt_ab = {pid: optim.LBFGS([ab[pid]['theta']],
+                    lr=lbfgs_lr_ab,
+                    max_iter=max_lbfgs_it, 
+                    tolerance_grad=tolerance_grad, 
+                    tolerance_change=tolerance_change)
+                    for pid in ab}
 
     # --------- 训练循环 -----------
     training_stopped = False
@@ -206,7 +228,7 @@ def fit_population(
             opt_w_adam.zero_grad()
             loss_w = 0.
             for pid, dat in patient_data.items():
-                loss_w += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
+                loss_w += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma, reg_lambda=reg_lambda_alpha)
             
             if torch.isnan(loss_w):
                 print(f"Iter {it+1:02d}: Adam loss for w is NaN. Stopping training.")
@@ -216,21 +238,15 @@ def fit_population(
                 opt_w_adam.step()
                 scheduler.step()
         else:  # L-BFGS
-            opt_w = optim.LBFGS(model.parameters(), 
-                                lr=lbfgs_lr_w,
-                                max_iter=max_lbfgs_it, 
-                                tolerance_grad=tolerance_grad, 
-                                tolerance_change=tolerance_change)
-
             def closure_w():
-                opt_w.zero_grad()
+                opt_w_lbfgs.zero_grad()
                 loss = 0.
                 for pid, dat in patient_data.items():
-                    loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
+                    loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma, reg_lambda=reg_lambda_alpha)
                 if not torch.isnan(loss):
                     loss.backward()
                 return loss
-            loss_w = opt_w.step(closure_w)
+            loss_w = opt_w_lbfgs.step(closure_w)
 
             if torch.isnan(loss_w):
                 print(f"Iter {it+1:02d}: L-BFGS loss for w is NaN. Stopping training.")
@@ -270,7 +286,7 @@ def fit_population(
         for pid, dat in patient_data.items():
             if use_adam:
                 opt_ab_adam[pid].zero_grad()
-                loss_ab = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
+                loss_ab = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma, reg_lambda=reg_lambda_alpha)
 
                 if torch.isnan(loss_ab):
                     print(f"Iter {it+1:02d}: Adam loss for α,β for pid {pid} is NaN. Stopping training.")
@@ -279,19 +295,13 @@ def fit_population(
                 loss_ab.backward()
                 opt_ab_adam[pid].step()
             else:  # L-BFGS
-                opt_ab = optim.LBFGS([ab[pid]['theta']],
-                                     lr=lbfgs_lr_ab,
-                                     max_iter=max_lbfgs_it, 
-                                     tolerance_grad=tolerance_grad, 
-                                     tolerance_change=tolerance_change)
-
                 def closure_ab():
-                    opt_ab.zero_grad()
-                    loss = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
+                    opt_ab[pid].zero_grad()
+                    loss = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma, reg_lambda=reg_lambda_alpha)
                     if not torch.isnan(loss):
                         loss.backward()
                     return loss
-                loss_ab = opt_ab.step(closure_ab)
+                loss_ab = opt_ab[pid].step(closure_ab)
 
                 if torch.isnan(loss_ab):
                     print(f"Iter {it+1:02d}: L-BFGS loss for α,β for pid {pid} is NaN. Stopping training.")
@@ -308,7 +318,7 @@ def fit_population(
                 num_patients = 0
                 for pid, dat in patient_data.items():
                     if dat['t'].shape[0] >= 2:
-                         total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'])
+                         total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma, reg_lambda=reg_lambda_alpha)
                          num_patients += 1
                 
                 mean_loss = total_loss / num_patients if num_patients > 0 else 0.
@@ -326,6 +336,47 @@ def fit_population(
 
 model_fix, ab_dict = fit_population(
     patient_data,)
+
+current_pid = os.getpid()
+torch.save(model_fix, f'./model{current_pid}.pt')
+
+# ---------- 为 alpha vs. MSE 散点图计算最终 MSE ----------
+final_mses = {}
+with torch.no_grad():
+    all_biomarkers = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
+    sigma = all_biomarkers.var(dim=0).clamp_min(1e-8)
+    
+    # 为计算损失，将 alpha, beta 转回 theta
+    ab_theta_final = {}
+    for pid, (alpha, beta) in ab_dict.items():
+        theta0 = torch.log(torch.tensor(alpha) - 1e-4)
+        theta1 = torch.tensor(beta)
+        ab_theta_final[pid] = torch.tensor([theta0.item(), theta1.item()])
+
+    for pid, dat in patient_data.items():
+        if dat['t'].shape[0] >= 2:
+            mse = calculate_combined_loss(model_fix, dat, ab_theta_final[pid], sigma)
+            final_mses[pid] = mse.item()
+
+# 提取 alpha 值
+alphas = {pid: val[0] for pid, val in ab_dict.items()}
+
+# 准备绘图数据
+pids_list = list(final_mses.keys())
+mse_values = [final_mses[p] for p in pids_list]
+alpha_values = [alphas[p] for p in pids_list]
+
+# 绘制 alpha vs. MSE 散点图
+fig_alpha_mse, ax_alpha_mse = plt.subplots(figsize=(8, 6))
+ax_alpha_mse.scatter(alpha_values, mse_values, alpha=0.6)
+ax_alpha_mse.set_xlabel('Alpha')
+ax_alpha_mse.set_ylabel('Final MSE')
+ax_alpha_mse.set_title('Alpha vs. Final MSE for each patient')
+ax_alpha_mse.grid(True)
+plt.tight_layout()
+plt.savefig('alpha_mse_scatter.png')
+plt.show()
+
 
 # ---------- 2. 绘制人群四联图 （仅绘制 |s|≤bound 的病例） -----------------
 # -------- 过滤病例 ---------
