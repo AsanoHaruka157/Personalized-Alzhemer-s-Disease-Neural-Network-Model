@@ -54,21 +54,58 @@ class Gaussian(nn.Module):
         return torch.exp(-torch.pow(x, 2))
 
 class PopulationODE(nn.Module):
-    def __init__(self, hidden_dim=16):
+    def __init__(self, hidden_dim=32):
         super().__init__()
-        # A unified network with a custom -Tanh activation before the final layer
-        self.net = nn.Sequential(
+        
+        # 1. 量级网络 (Magnitude Network)
+        #    决定变化的最大速度和方向 (+/-)。
+        #    最后一层是线性层，以便输出任意实数。
+        self.magnitude_net = nn.Sequential(
             nn.Linear(4, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 4),
-            nn.LayerNorm(4),
-            Gaussian(),
         )
 
+        # 2. 门控网络 (Gating Network)
+        #    它的任务是学习一个从 y 到 z 的映射。
+        #    这个 z 将作为高斯函数的输入，从而控制门控的开关。
+        self.gating_net = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.Tanh(),
+            # 使用LayerNorm可以稳定中间层的激活值分布，有助于训练
+            nn.LayerNorm(hidden_dim), 
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.LayerNorm(hidden_dim),
+            # 最终输出一个控制信号 z，这个z的中心可以由该层的偏置项学习
+            nn.Linear(hidden_dim, 4) 
+        )
+        
+        # 3. 高斯激活层
+        self.gaussian_activation = Gaussian()
+
     def f(self, y):
-        """ The ODE function, defined by a unified neural network. """
-        return self.net(y)
+        """
+        ODE 函数: dy/ds = f(y)
+        f(y) = magnitude * gate
+        """
+        
+        # 计算变化的潜在“量级”和“方向”
+        # 输出范围是(-inf, +inf)
+        magnitude = self.magnitude_net(y)
+        
+        # 通过门控网络计算高斯函数的输入 z
+        # 网络会学习如何调整 z 的值，使得当 y 处于某个关键点时，z 接近 0
+        gate_input = self.gating_net(y)
+        
+        # 计算高斯门控的输出值，范围是 (0, 1]
+        # 当 gate_input 接近 0 时，gate_output 接近 1 (阀门打开)
+        # 当 gate_input 远离 0 时，gate_output 接近 0 (阀门关闭)
+        gate_output = self.gaussian_activation(gate_input)
+        
+        # 最终导数 = 量级 * 门控
+        # 实现了在特定区间(gate_output ≈ 1)发生剧烈变化，在其他区间(gate_output ≈ 0)保持平稳
+        return magnitude * gate_output
 
     def forward(self, s_grid, y0):
         # 4th-order Runge-Kutta integration to solve the ODE
