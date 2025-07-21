@@ -36,6 +36,23 @@ class NegativeTanh(nn.Module):
     def forward(self, x):
         return -torch.tanh(x)
 
+class Gaussian(nn.Module):
+    """
+    Gaussian activation function.
+    Applies the element-wise function:
+    Gaussian(x) = exp(-x^2)
+    
+    Shape:
+        - Input: (N, *) where * means, any number of additional
+          dimensions
+        - Output: (N, *), same shape as the input
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return torch.exp(-torch.pow(x, 2))
+
 class PopulationODE(nn.Module):
     def __init__(self, hidden_dim=16):
         super().__init__()
@@ -44,13 +61,9 @@ class PopulationODE(nn.Module):
             nn.Linear(4, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.Sigmoid(),
-            nn.Linear(hidden_dim, 4)
+            nn.Linear(hidden_dim, 4),
+            nn.LayerNorm(4),
+            Gaussian(),
         )
 
     def f(self, y):
