@@ -243,9 +243,9 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
-        n_adam      = 200,      # adam 阶段迭代次数
-        n_lbfgs    = 0,     # lbfgs 阶段迭代次数
-        adam_lr_w    = 1e-3,
+        n_adam      = 250,      # adam 阶段迭代次数
+        n_lbfgs    = 50,     # lbfgs 阶段迭代次数
+        adam_lr_w    = 1e-2,
         adam_lr_ab   = 1e-3,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
@@ -333,7 +333,7 @@ def fit_population(
     opt_w_adam  = optim.Adam(model.parameters(), lr=adam_lr_w, weight_decay=1e-4)
     opt_ab_adam = {pid: optim.Adam([ab[pid]['theta']], lr=adam_lr_ab)
                    for pid in ab}
-    scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=[100], gamma=0.1, last_epoch=-1)
+    scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=[100,200,300], gamma=0.5, last_epoch=-1)
     opt_w_lbfgs = optim.LBFGS(model.parameters(), 
                                 lr=lbfgs_lr_w,
                                 max_iter=max_lbfgs_it, 
