@@ -7,6 +7,7 @@ import numpy as np
 import torch.nn.functional as F
 import pccmnn as pc
 import os
+from torch.utils.data import Dataset, DataLoader
 
 # ------------------ 你已有的部分 ------------------
 csf_dict = pc.load_csf_data()
@@ -230,6 +231,16 @@ import torch, torch.nn as nn, torch.optim as optim
 import torch.nn.functional as F
 from math import ceil
 
+class PatientDataset(Dataset):
+    def __init__(self, pids):
+        self.pids = pids
+
+    def __len__(self):
+        return len(self.pids)
+
+    def __getitem__(self, idx):
+        return self.pids[idx]
+
 def fit_population(
         patient_data,
         n_adam      = 200,      # adam 阶段迭代次数
@@ -238,11 +249,13 @@ def fit_population(
         adam_lr_ab   = 1e-3,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
+        batch_size=64,
+        weighted_sampling=True,
         max_lbfgs_it = 10,
         tolerance_grad = 0,
         tolerance_change = 0,
         reg_lambda_alpha=1e-2,
-        reg_lambda_smooth=1.0,
+        reg_lambda_smooth=1e-2,
         early_stop_patience=100,
         early_stop_threshold=0.005):
     
@@ -267,6 +280,24 @@ def fit_population(
         print("Model successfully compiled with JIT.")
     except Exception as e:
         print(f"JIT compilation failed: {e}. Running in eager mode.")
+
+    # --------- Minibatch Dataloader Setup -----------
+    patient_pids = list(patient_data.keys())
+    use_minibatch = batch_size < len(patient_pids)
+
+    batch_iterator = None
+    if use_minibatch and n_adam > 0:
+        print(f"Using mini-batching with batch size {batch_size}.")
+        dataset = PatientDataset(patient_pids)
+        
+        sampler = None
+        if weighted_sampling:
+            print("Using weighted sampling based on the number of time points per patient.")
+            weights = [float(patient_data[pid]['t'].shape[0]) for pid in patient_pids]
+            sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=n_adam * batch_size, replacement=True)
+        
+        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
+        batch_iterator = iter(dataloader)
 
     stage_dict = pc.load_stage_dict()
     ab = {}
@@ -320,25 +351,53 @@ def fit_population(
     # Early stopping state
     early_stop_counter = 0
     last_adam_loss = float('inf')
+    adam_loss_history = []
 
     for it in range(n_adam + n_lbfgs):
         use_adam = it < n_adam
 
         # ======================== 更新 w =========================
         if use_adam:
+            if use_minibatch:
+                try:
+                    batch_pids = next(batch_iterator)
+                except StopIteration:
+                    print("Batch iterator exhausted. This should not happen with the configured sampler.")
+                    continue
+            else:
+                batch_pids = patient_pids
+
             opt_w_adam.zero_grad()
             loss_w = 0.
-            for pid, dat in patient_data.items():
+            
+            # Convert tensor PIDs to integer for dict lookup
+            batch_pids_list = [pid.item() for pid in batch_pids] if use_minibatch else batch_pids
+            valid_pids_in_batch = [pid for pid in batch_pids_list if patient_data[pid]['t'].shape[0] >= 2]
+            
+            if not valid_pids_in_batch:
+                continue
+
+            for pid in valid_pids_in_batch:
+                dat = patient_data[pid]
                 loss_w += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma, reg_lambda_smooth=reg_lambda_smooth)
             
+            if len(valid_pids_in_batch) > 0:
+                loss_w /= len(valid_pids_in_batch)
+
+            # --- Early stopping and logging with moving average ---
+            adam_loss_history.append(loss_w.item())
+            if len(adam_loss_history) > 30: # Moving average window
+                adam_loss_history.pop(0)
+            current_avg_loss = sum(adam_loss_history) / len(adam_loss_history)
+
             # --- Early stopping logic ---
             if last_adam_loss != float('inf'):
-                relative_change = (last_adam_loss - loss_w.item()) / abs(last_adam_loss) if last_adam_loss != 0 else float('inf')
+                relative_change = (last_adam_loss - current_avg_loss) / abs(last_adam_loss) if last_adam_loss != 0 else float('inf')
                 if relative_change < early_stop_threshold:
                     early_stop_counter += 1
                 else:
                     early_stop_counter = 0
-            last_adam_loss = loss_w.item()
+            last_adam_loss = current_avg_loss
 
             if early_stop_counter >= early_stop_patience:
                 print(f"Iter {it+1:02d}: Early stopping. Loss improvement < {early_stop_threshold*100:.1f}% for {early_stop_patience} steps.")
@@ -402,7 +461,12 @@ def fit_population(
 
 
         # ====================== 更新 α,β ==========================
-        for pid, dat in patient_data.items():
+        current_pids_for_ab = valid_pids_in_batch if use_adam else patient_data.keys()
+        for pid in current_pids_for_ab:
+            dat = patient_data[pid]
+            if dat['t'].shape[0] < 2:
+                continue
+
             if use_adam:
                 opt_ab_adam[pid].zero_grad()
                 loss_ab = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma, reg_lambda_smooth)
@@ -432,19 +496,24 @@ def fit_population(
 
         # ----------- 监控 ----------
         if (it+1) % 1 == 0:
-            with torch.no_grad():
-                total_loss = 0.
-                num_patients = 0
-                for pid, dat in patient_data.items():
-                    if dat['t'].shape[0] >= 2:
-                         total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
-                         num_patients += 1
-                
-                mean_loss = total_loss / num_patients if num_patients > 0 else 0.
-
-            print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
-                  f"{'Adam' if use_adam else 'LBFGS'} | "
-                  f"MSE={mean_loss.item():.4f}")
+            if use_adam:
+                print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
+                      f"Adam | "
+                      f"Batch MSE={loss_w.item():.4f} | "
+                      f"Avg MSE={current_avg_loss:.4f}")
+            else: # L-BFGS logging
+                with torch.no_grad():
+                    total_loss = 0.
+                    num_patients = 0
+                    for pid, dat in patient_data.items():
+                        if dat['t'].shape[0] >= 2:
+                            total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
+                            num_patients += 1
+                    
+                    mean_loss = total_loss / num_patients if num_patients > 0 else 0.
+                print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
+                    f"LBFGS | "
+                    f"MSE={mean_loss.item():.4f}")
 
     # --------- 输出 ----------
     model.eval() # Switch to evaluation mode before returning
