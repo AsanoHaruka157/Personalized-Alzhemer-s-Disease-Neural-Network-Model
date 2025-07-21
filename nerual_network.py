@@ -234,8 +234,8 @@ def fit_population(
         patient_data,
         n_adam      = 200,      # adam 阶段迭代次数
         n_lbfgs    = 0,     # lbfgs 阶段迭代次数
-        adam_lr_w    = 5e-3,
-        adam_lr_ab   = 5e-3,
+        adam_lr_w    = 1e-3,
+        adam_lr_ab   = 1e-3,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
         max_lbfgs_it = 10,
@@ -243,7 +243,7 @@ def fit_population(
         tolerance_change = 0,
         reg_lambda_alpha=1e-2,
         reg_lambda_smooth=1.0,
-        early_stop_patience=20,
+        early_stop_patience=100,
         early_stop_threshold=0.005):
     
     # ---------- 计算每个生物标记物的全局方差以调整权重 ----------
