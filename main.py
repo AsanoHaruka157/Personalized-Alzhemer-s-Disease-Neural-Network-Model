@@ -62,21 +62,17 @@ class PopulationODE(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.Tanh(),
+            nn.Dropout(),
             nn.Linear(hidden_dim, 4),
             nn.Sigmoid(),
+            nn.Dropout(),
         )
         # 新增：A为可学习参数
-        self.A = nn.Parameter(2*torch.ones(4))
+        self.A = nn.Parameter(2*torch.ones(4, dtype=torch.float32))
 
     def f(self, y):
-        """
-        ODE 函数: dy/ds = f(y)
-        f(y) = magnitude * gate
-        """
-        net = self.net(y)
-        
-        gate = torch.sigmoid(y * (self.A - y))
-        z = net * gate
+        y = y.float()
+        z = torch.sigmoid(y*(self.A-y))*self.net(y)
         return z
 
     def forward(self, s_grid, y0):
@@ -218,11 +214,15 @@ def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None, reg_lambda_smo
     Calculates a combined loss: 50% sequential and 50% global.
     Includes an optional regularization term for smoothness.
     """
+    B = torch.tensor([0,0,0,0])
+    C = torch.tensor([0.5,0.5,0.5,0.5])
+    D = torch.tensor([1,1,1,1])
     #loss_seq = calculate_sequential_loss(model, dat, ab_pid_theta, sigma)
     res = residual(model, dat, ab_pid_theta, sigma)
     loss_global = calculate_global_loss(model, dat, ab_pid_theta, sigma)
-    
-    combined_loss = loss_global + res
+    zero = torch.zeros(4)
+    one = torch.ones(4)
+    combined_loss = ( loss_global + res ) * (torch.norm(model.f(B)) + torch.norm(model.f(D))) / (torch.norm(model.f(C)) + 1e-2)
         
     if reg_lambda_smooth > 0:
         alpha = torch.exp(ab_pid_theta[0]) + 1e-4
@@ -251,8 +251,8 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
-        n_adam      = 600,      # adam 阶段迭代次数
-        n_lbfgs    = 0,     # lbfgs 阶段迭代次数
+        n_adam      = 150,      # adam 阶段迭代次数
+        n_lbfgs    = 20,     # lbfgs 阶段迭代次数
         adam_lr_w    = 1e-2,
         adam_lr_ab   = 1e-3,
         lbfgs_lr_w   = 1e-2,
