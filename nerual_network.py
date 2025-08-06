@@ -243,13 +243,13 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
-        n_adam      = 250,      # adam 阶段迭代次数
-        n_lbfgs    = 50,     # lbfgs 阶段迭代次数
+        n_adam      = 600,      # adam 阶段迭代次数
+        n_lbfgs    = 0,     # lbfgs 阶段迭代次数
         adam_lr_w    = 1e-2,
         adam_lr_ab   = 1e-3,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
-        batch_size=64,
+        batch_size=128,
         weighted_sampling=True,
         max_lbfgs_it = 10,
         tolerance_grad = 0,
@@ -257,7 +257,7 @@ def fit_population(
         reg_lambda_alpha=1e-2,
         reg_lambda_smooth=1e-2,
         early_stop_patience=100,
-        early_stop_threshold=0.005):
+        early_stop_threshold=0.001):
     
     # ---------- 计算每个生物标记物的全局方差以调整权重 ----------
     all_biomarkers = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
@@ -299,6 +299,15 @@ def fit_population(
         dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
         batch_iterator = iter(dataloader)
 
+    lbfgs_dataloader = None
+    if use_minibatch and n_lbfgs > 0:
+        print("Preparing mini-batching for L-BFGS phase.")
+        if 'dataset' not in locals():
+            dataset = PatientDataset(patient_pids)
+        # For L-BFGS, we typically iterate over epochs. A simple shuffled dataloader is better.
+        lbfgs_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    lbfgs_batch_iterator = None # Will be initialized inside loop
+
     stage_dict = pc.load_stage_dict()
     ab = {}
     for pid, dat in patient_data.items():
@@ -333,7 +342,7 @@ def fit_population(
     opt_w_adam  = optim.Adam(model.parameters(), lr=adam_lr_w, weight_decay=1e-4)
     opt_ab_adam = {pid: optim.Adam([ab[pid]['theta']], lr=adam_lr_ab)
                    for pid in ab}
-    scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=[100,200,300], gamma=0.5, last_epoch=-1)
+    scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=[200,300,400,500,600,700,800,900,1000], gamma=0.5, last_epoch=-1)
     opt_w_lbfgs = optim.LBFGS(model.parameters(), 
                                 lr=lbfgs_lr_w,
                                 max_iter=max_lbfgs_it, 
@@ -416,15 +425,46 @@ def fit_population(
             early_stop_counter = 0
             last_adam_loss = float('inf')
 
-            def closure_w():
-                opt_w_lbfgs.zero_grad()
-                loss = 0.
-                for pid, dat in patient_data.items():
-                    loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma, reg_lambda_smooth=reg_lambda_smooth)
-                if not torch.isnan(loss):
-                    loss.backward()
-                return loss
-            loss_w = opt_w_lbfgs.step(closure_w)
+            if use_minibatch:
+                if lbfgs_batch_iterator is None:
+                    lbfgs_batch_iterator = iter(lbfgs_dataloader)
+                try:
+                    batch_pids = next(lbfgs_batch_iterator)
+                except StopIteration:
+                    # Epoch finished for L-BFGS, reset iterator
+                    lbfgs_batch_iterator = iter(lbfgs_dataloader)
+                    batch_pids = next(lbfgs_batch_iterator)
+                
+                batch_pids_list = [pid.item() for pid in batch_pids]
+                valid_pids_in_batch = [p for p in batch_pids_list if patient_data[p]['t'].shape[0] >= 2]
+                
+                if not valid_pids_in_batch:
+                    continue
+
+                def closure_w():
+                    opt_w_lbfgs.zero_grad()
+                    loss = 0.
+                    for pid in valid_pids_in_batch:
+                        dat = patient_data[pid]
+                        loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma, reg_lambda_smooth=reg_lambda_smooth)
+                    
+                    if len(valid_pids_in_batch) > 0:
+                        loss /= len(valid_pids_in_batch)
+
+                    if not torch.isnan(loss):
+                        loss.backward()
+                    return loss
+                loss_w = opt_w_lbfgs.step(closure_w)
+            else:
+                def closure_w():
+                    opt_w_lbfgs.zero_grad()
+                    loss = 0.
+                    for pid, dat in patient_data.items():
+                        loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma, reg_lambda_smooth=reg_lambda_smooth)
+                    if not torch.isnan(loss):
+                        loss.backward()
+                    return loss
+                loss_w = opt_w_lbfgs.step(closure_w)
 
             if torch.isnan(loss_w):
                 print(f"Iter {it+1:02d}: L-BFGS loss for w is NaN. Stopping training.")
@@ -461,7 +501,13 @@ def fit_population(
 
 
         # ====================== 更新 α,β ==========================
-        current_pids_for_ab = valid_pids_in_batch if use_adam else patient_data.keys()
+        if use_adam:
+            current_pids_for_ab = valid_pids_in_batch
+        elif use_minibatch: # LBFGS with minibatch
+            current_pids_for_ab = valid_pids_in_batch
+        else: # LBFGS full batch
+            current_pids_for_ab = patient_data.keys()
+            
         for pid in current_pids_for_ab:
             dat = patient_data[pid]
             if dat['t'].shape[0] < 2:
@@ -502,18 +548,23 @@ def fit_population(
                       f"Batch MSE={loss_w.item():.4f} | "
                       f"Avg MSE={current_avg_loss:.4f}")
             else: # L-BFGS logging
-                with torch.no_grad():
-                    total_loss = 0.
-                    num_patients = 0
-                    for pid, dat in patient_data.items():
-                        if dat['t'].shape[0] >= 2:
-                            total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
-                            num_patients += 1
-                    
-                    mean_loss = total_loss / num_patients if num_patients > 0 else 0.
-                print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
-                    f"LBFGS | "
-                    f"MSE={mean_loss.item():.4f}")
+                if use_minibatch:
+                    print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
+                          f"LBFGS | "
+                          f"Batch MSE={loss_w.item():.4f}")
+                else:
+                    with torch.no_grad():
+                        total_loss = 0.
+                        num_patients = 0
+                        for pid, dat in patient_data.items():
+                            if dat['t'].shape[0] >= 2:
+                                total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
+                                num_patients += 1
+                        
+                        mean_loss = total_loss / num_patients if num_patients > 0 else 0.
+                    print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
+                        f"LBFGS | "
+                        f"MSE={mean_loss.item():.4f}")
 
     # --------- 输出 ----------
     model.eval() # Switch to evaluation mode before returning
