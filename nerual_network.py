@@ -58,55 +58,26 @@ class PopulationODE(nn.Module):
     def __init__(self, hidden_dim=32):
         super().__init__()
         
-        # 1. 量级网络 (Magnitude Network)
-        #    决定变化的最大速度和方向 (+/-)。
-        #    最后一层是线性层，以便输出任意实数。
-        self.magnitude_net = nn.Sequential(
+        # 1. 活动网络
+        self.net = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, 4),
+            nn.Sigmoid(),
         )
-
-        # 2. 门控网络 (Gating Network)
-        #    它的任务是学习一个从 y 到 z 的映射。
-        #    这个 z 将作为高斯函数的输入，从而控制门控的开关。
-        self.gating_net = nn.Sequential(
-            nn.Linear(4, hidden_dim),
-            nn.Tanh(),
-            # 使用LayerNorm可以稳定中间层的激活值分布，有助于训练
-            nn.LayerNorm(hidden_dim), 
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.LayerNorm(hidden_dim),
-            # 最终输出一个控制信号 z，这个z的中心可以由该层的偏置项学习
-            nn.Linear(hidden_dim, 4) 
-        )
-        
-        # 3. 高斯激活层
-        self.gaussian_activation = Gaussian()
+        # 新增：A为可学习参数
+        self.A = nn.Parameter(2*torch.ones(4))
 
     def f(self, y):
         """
         ODE 函数: dy/ds = f(y)
         f(y) = magnitude * gate
         """
+        net = self.net(y)
         
-        # 计算变化的潜在“量级”和“方向”
-        # 输出范围是(-inf, +inf)
-        magnitude = self.magnitude_net(y)
-        
-        # 通过门控网络计算高斯函数的输入 z
-        # 网络会学习如何调整 z 的值，使得当 y 处于某个关键点时，z 接近 0
-        gate_input = self.gating_net(y)
-        
-        # 计算高斯门控的输出值，范围是 (0, 1]
-        # 当 gate_input 接近 0 时，gate_output 接近 1 (阀门打开)
-        # 当 gate_input 远离 0 时，gate_output 接近 0 (阀门关闭)
-        gate_output = self.gaussian_activation(gate_input)
-        
-        # 最终导数 = 量级 * 门控
-        # 实现了在特定区间(gate_output ≈ 1)发生剧烈变化，在其他区间(gate_output ≈ 0)保持平稳
-        return magnitude * gate_output
+        gate = torch.sigmoid(y * (self.A - y))
+        z = net * gate
+        return z
 
     def forward(self, s_grid, y0):
         # 4th-order Runge-Kutta integration to solve the ODE
@@ -165,6 +136,42 @@ def calculate_sequential_loss(model, dat, ab_pid_theta, sigma=None):
     
     return loss.mean()
 
+def residual(model, dat, ab_pid_theta, sigma=None):
+    """
+    Calculates the residual: dy/dt - f(y),
+    where dy/dt is computed by finite difference (centered for interior, one-sided for endpoints).
+    Returns mean squared error of the residual.
+    """
+    num_steps = dat['t'].shape[0]
+    if num_steps < 2:
+        device = next(model.parameters()).device
+        return torch.tensor(0.0, device=device)
+
+    alpha = torch.exp(ab_pid_theta[0]) + 1e-4
+    beta  = ab_pid_theta[1]
+    s = alpha * dat['t'] + beta  # (N,)
+    y = dat['y']                 # (N, D)
+
+    # Compute dy/dt using finite differences
+    t = dat['t']
+    dy_dt = torch.zeros_like(y)
+    # Forward difference for the first point
+    dy_dt[0] = (y[1] - y[0]) / (t[1] - t[0])
+    # Centered difference for interior points
+    if num_steps > 2:
+        dy_dt[1:-1] = (y[2:] - y[:-2]) / (t[2:].unsqueeze(1) - t[:-2].unsqueeze(1))
+    # Backward difference for the last point
+    dy_dt[-1] = (y[-1] - y[-2]) / (t[-1] - t[-2])
+
+    # Model prediction f(y) at each s, y
+    fy = model(s, y)  # (N, D)
+
+    residual = dy_dt - fy
+    loss = residual ** 2
+    if sigma is not None:
+        loss = loss / sigma
+    return loss.mean()
+
 
 def calculate_global_loss(model, dat, ab_pid_theta, sigma=None):
     """
@@ -211,10 +218,11 @@ def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None, reg_lambda_smo
     Calculates a combined loss: 50% sequential and 50% global.
     Includes an optional regularization term for smoothness.
     """
-    loss_seq = calculate_sequential_loss(model, dat, ab_pid_theta, sigma)
+    #loss_seq = calculate_sequential_loss(model, dat, ab_pid_theta, sigma)
+    res = residual(model, dat, ab_pid_theta, sigma)
     loss_global = calculate_global_loss(model, dat, ab_pid_theta, sigma)
     
-    combined_loss = 0.5 * loss_seq + 0.5 * loss_global
+    combined_loss = loss_global + res
         
     if reg_lambda_smooth > 0:
         alpha = torch.exp(ab_pid_theta[0]) + 1e-4
@@ -255,7 +263,7 @@ def fit_population(
         tolerance_grad = 0,
         tolerance_change = 0,
         reg_lambda_alpha=1e-2,
-        reg_lambda_smooth=1e-2,
+        reg_lambda_smooth=0.,
         early_stop_patience=100,
         early_stop_threshold=0.001):
     
