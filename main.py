@@ -54,13 +54,22 @@ class Gaussian(nn.Module):
     def forward(self, x):
         return torch.exp(-torch.pow(x, 2))
 
+# ---------- 计算y的分位数并保存为全局变量B, C, D ----------
+# 收集所有患者的y数据
+all_y_data = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
+
+# 计算5分位数、50分位数（中位数）和95分位数
+B = torch.quantile(all_y_data, 0.05, dim=0)  # 5分位数
+C = torch.quantile(all_y_data, 0.50, dim=0)  # 50分位数（中位数）
+D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
+
 class PopulationODE(nn.Module):
     def __init__(self, hidden_dim=32):
         super().__init__()
         
-        # 1. 活动网络
+        # 1. 活动网络 - 现在接受5个输入：4个生物标记物 + s值
         self.net = nn.Sequential(
-            nn.Linear(4, hidden_dim),
+            nn.Linear(5, hidden_dim),
             nn.Tanh(),
             nn.Dropout(),
             nn.Linear(hidden_dim, 4),
@@ -68,12 +77,22 @@ class PopulationODE(nn.Module):
             nn.Dropout(),
         )
         # 新增：A为可学习参数
-        self.A = nn.Parameter(2*torch.ones(4, dtype=torch.float32))
+        self.A = nn.Parameter(torch.zeros(4, dtype=torch.float32))
 
-    def f(self, y):
+    def f(self, y, s):
         y = y.float()
-        z = torch.sigmoid(y*(self.A-y))*self.net(y)
-        return z
+        s = s.float()
+        # 确保s是标量，将其扩展为与y兼容的形状
+        if s.dim() == 0:  # s是标量
+            s_expanded = s.unsqueeze(0)  # 变成[1]
+        else:
+            s_expanded = s
+        # 将y和s连接起来作为网络输入
+        z = torch.cat([y, s_expanded], dim=0)  # 连接为[5]的向量
+        net_output = self.net(z.unsqueeze(0))  # 添加batch维度 -> [1, 5] -> [1, 4]
+        net_output = net_output.squeeze(0)  # 移除batch维度 -> [4]
+        result = 1e-2*torch.sigmoid(y)*(self.A-torch.sigmoid(y))*net_output
+        return result
 
     def forward(self, s_grid, y0):
         # 4th-order Runge-Kutta integration to solve the ODE
@@ -82,10 +101,10 @@ class PopulationODE(nn.Module):
             h = s_grid[i] - s_grid[i-1]
             y_i = ys[-1]
             
-            k1 = self.f(y_i)
-            k2 = self.f(y_i + 0.5 * h * k1)
-            k3 = self.f(y_i + 0.5 * h * k2)
-            k4 = self.f(y_i + h * k3)
+            k1 = self.f(y_i, s_grid[i-1])
+            k2 = self.f(y_i + 0.5 * h * k1, s_grid[i-1])
+            k3 = self.f(y_i + 0.5 * h * k2, s_grid[i-1])
+            k4 = self.f(y_i + h * k3, s_grid[i-1])
             
             y_next = y_i + (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
             ys.append(y_next)
@@ -160,7 +179,10 @@ def residual(model, dat, ab_pid_theta, sigma=None):
     dy_dt[-1] = (y[-1] - y[-2]) / (t[-1] - t[-2])
 
     # Model prediction f(y) at each s, y
-    fy = model(s, y)  # (N, D)
+    # 需要为每个时间点调用f函数
+    fy = torch.zeros_like(y)
+    for i in range(len(s)):
+        fy[i] = model.f(y[i], s[i])
 
     residual = dy_dt - fy
     loss = residual ** 2
@@ -214,15 +236,14 @@ def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None, reg_lambda_smo
     Calculates a combined loss: 50% sequential and 50% global.
     Includes an optional regularization term for smoothness.
     """
-    B = torch.tensor([0,0,0,0])
-    C = torch.tensor([0.5,0.5,0.5,0.5])
-    D = torch.tensor([1,1,1,1])
     #loss_seq = calculate_sequential_loss(model, dat, ab_pid_theta, sigma)
     res = residual(model, dat, ab_pid_theta, sigma)
     loss_global = calculate_global_loss(model, dat, ab_pid_theta, sigma)
     zero = torch.zeros(4)
     one = torch.ones(4)
-    combined_loss = ( loss_global + res ) * (torch.norm(model.f(B)) + torch.norm(model.f(D))) / (torch.norm(model.f(C)) + 1e-2)
+    # 为f函数调用提供s值，这里使用0作为默认值
+    s_default = torch.tensor(0.0)
+    combined_loss = ( loss_global + res ) * (torch.norm(model.f(B, s_default)) + torch.norm(model.f(D, s_default))) / (torch.norm(model.f(C, s_default)) + 1e-2)
         
     if reg_lambda_smooth > 0:
         alpha = torch.exp(ab_pid_theta[0]) + 1e-4
@@ -251,7 +272,7 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
-        n_adam      = 150,      # adam 阶段迭代次数
+        n_adam      = 80,      # adam 阶段迭代次数
         n_lbfgs    = 20,     # lbfgs 阶段迭代次数
         adam_lr_w    = 1e-2,
         adam_lr_ab   = 1e-3,
@@ -614,8 +635,59 @@ if not keep:
 else:
     y0_pop = torch.stack([patient_data[p]['y0'] for p in keep]).mean(0)
 
-s_curve = torch.linspace(s_min.item(), s_max.item(), 400)
-y_curve = model_fix(s_curve, y0_pop).detach().numpy()
+# ---------- 新的预测方法：基于局部均值的逐步预测 ----------
+s_curve = torch.linspace(s_min.item(), s_max.item(), 10)
+
+# 收集所有患者的s和y数据点
+all_s_points = []
+all_y_points = []
+for p in keep if keep else patient_data.keys():
+    a, b = ab_dict[p]
+    s_patient = a * patient_data[p]['t'] + b
+    y_patient = patient_data[p]['y']
+    all_s_points.append(s_patient)
+    all_y_points.append(y_patient)
+
+all_s_points = torch.cat(all_s_points)
+all_y_points = torch.cat(all_y_points, dim=0)
+
+# 逐步预测轨迹
+y_curve_new = []
+window_size = 0.1 * (s_max - s_min)  # 窗口大小为s范围的10%
+
+# 初始点：使用s_min附近的数据点均值
+mask_init = torch.abs(all_s_points - s_min) <= window_size
+if mask_init.sum() > 0:
+    y_current = all_y_points[mask_init].mean(dim=0)
+else:
+    y_current = y0_pop  # 回退到原始方法
+
+y_curve_new.append(y_current.clone())
+
+# 逐步预测
+with torch.no_grad():
+    for i in range(1, len(s_curve)):
+        s_current = s_curve[i-1]
+        s_next = s_curve[i]
+        
+        # 在当前s点附近寻找数据点并计算均值
+        mask = torch.abs(all_s_points - s_current) <= window_size
+        if mask.sum() > 0:
+            y_local_mean = all_y_points[mask].mean(dim=0)
+        else:
+            y_local_mean = y_current  # 如果没有附近的数据点，使用当前值
+        
+        # 使用模型从当前点预测到下一点
+        s_step = torch.tensor([s_current.item(), s_next.item()])
+        y_pred_step = model_fix(s_step, y_local_mean)
+        y_current = y_pred_step[1]  # 取预测的下一步
+        
+        y_curve_new.append(y_current.clone())
+
+y_curve_new = torch.stack(y_curve_new)
+y_curve = y_curve_new.detach().numpy()
+
+print(f"使用局部均值逐步预测方法，窗口大小: {window_size:.3f}")
 
 # --- 计算置信区间 ---
 with torch.no_grad():
@@ -630,10 +702,10 @@ with torch.no_grad():
         
         # Stack trajectories and calculate percentiles
         all_trajectories = torch.stack(all_trajectories) # (num_patients, len_s_curve, 4)
-        q25 = torch.quantile(all_trajectories, 0.25, dim=0).numpy()
-        q75 = torch.quantile(all_trajectories, 0.75, dim=0).numpy()
+        q10 = torch.quantile(all_trajectories, 0.10, dim=0).numpy()
+        q90 = torch.quantile(all_trajectories, 0.90, dim=0).numpy()
     else:
-        q25, q75 = None, None
+        q10, q90 = None, None
 # --- 结束计算 ---
 
 
@@ -662,21 +734,22 @@ for k, ax in enumerate(axes.flat):
             y_all = torch.cat(y_by_stage[stage]).numpy()
             ax.scatter(s_all, y_all, s=15, alpha=0.6, c=colors[stage], label=stage)
 
-    # --- 曲线 (平均轨迹) ---
-    ax.plot(s_curve, y_curve[:, k], lw=1.5, c='black', label='Mean Trajectory')
+    # --- 曲线 (基于局部均值的逐步预测轨迹) ---
+    ax.plot(s_curve, y_curve[:, k], lw=1.5, c='black', label='Local Mean Stepwise Trajectory')
     
     # --- 置信区间 ---
-    if q25 is not None and q75 is not None:
-        ax.fill_between(s_curve, q25[:, k], q75[:, k], color='gray', alpha=0.3, label='Confidence Interval')
+    if q10 is not None and q90 is not None:
+        ax.fill_between(s_curve, q10[:, k], q90[:, k], color='gray', alpha=0.3, label='Confidence Interval')
 
     ax.set_xlabel('Disease progression score  s')
     ax.set_ylabel(TITLES[k])
     ax.legend()
 
-fig2.suptitle(f'Population biomarker trajectories (s in [{s_min.item():.2f}, {s_max.item():.2f}])')
+fig2.suptitle(f'Population biomarker trajectories - Local Mean Stepwise Prediction (s in [{s_min.item():.2f}, {s_max.item():.2f}])')
 plt.tight_layout(rect=[0,0,1,0.96])
 plt.savefig(f'result_{current_pid}.png')
 
+'''
 # ---------- 为 alpha vs. MSE 散点图计算最终 MSE ----------
 final_mses = {}
 with torch.no_grad():
@@ -713,3 +786,102 @@ ax_alpha_mse.grid(True)
 plt.tight_layout()
 plt.savefig(f'alpha_mse_{current_pid}.png')
 plt.show()
+'''
+
+# ---------- 计算CN、LMCI、AD三个数据集上的标准MSE ----------
+print("\n计算各阶段的标准MSE...")
+
+# 按阶段分组患者
+stage_patients = {'CN': [], 'LMCI': [], 'AD': []}
+for pid in patient_data.keys():
+    stage = stage_dict.get(pid, 'Other')
+    if stage in stage_patients:
+        stage_patients[stage].append(pid)
+
+# 计算每个阶段的标准MSE - 使用网格拟合方法
+stage_mses = {}
+with torch.no_grad():
+    for stage, pids in stage_patients.items():
+        if not pids:
+            stage_mses[stage] = float('nan')
+            print(f"{stage}: 无患者数据")
+            continue
+        
+        # 收集该阶段所有患者的s和y数据点
+        stage_s_points = []
+        stage_y_points = []
+        
+        for pid in pids:
+            dat = patient_data[pid]
+            if dat['t'].shape[0] < 2:
+                continue
+                
+            alpha, beta = ab_dict[pid]
+            s_patient = alpha * dat['t'] + beta
+            y_patient = dat['y']
+            stage_s_points.append(s_patient)
+            stage_y_points.append(y_patient)
+        
+        if not stage_s_points:
+            stage_mses[stage] = float('nan')
+            print(f"{stage}: 无有效患者数据")
+            continue
+            
+        # 连接该阶段所有数据点
+        stage_s_points = torch.cat(stage_s_points)
+        stage_y_points = torch.cat(stage_y_points, dim=0)
+        
+        # 确定该阶段的s范围
+        stage_s_min = stage_s_points.min()
+        stage_s_max = stage_s_points.max()
+        
+        # 生成5个网格点
+        s_grid = torch.linspace(stage_s_min.item(), stage_s_max.item(), 5)
+        window_size = 0.2 * (stage_s_max - stage_s_min)  # 窗口大小为s范围的20%
+        
+        # 使用真实均值拟合轨迹
+        y_fitted = []
+        
+        for s_point in s_grid:
+            # 在当前s点附近寻找数据点并计算真实均值
+            mask = torch.abs(stage_s_points - s_point) <= window_size
+            if mask.sum() > 0:
+                y_local_mean = stage_y_points[mask].mean(dim=0)
+                y_fitted.append(y_local_mean)
+            else:
+                # 如果没有附近的数据点，使用最近的数据点
+                distances = torch.abs(stage_s_points - s_point)
+                closest_idx = torch.argmin(distances)
+                y_fitted.append(stage_y_points[closest_idx])
+        
+        y_fitted = torch.stack(y_fitted)  # (5, 4)
+        
+        # 使用模型预测相同的网格点
+        # 使用该阶段所有患者y0的均值作为初始点
+        y0_stage = torch.stack([patient_data[pid]['y0'] for pid in pids if patient_data[pid]['t'].shape[0] >= 2]).mean(0)
+        y_predicted = model_fix(s_grid, y0_stage)  # (5, 4)
+        
+        # 计算标准MSE
+        mse = torch.mean((y_predicted - y_fitted) ** 2).item()
+        stage_mses[stage] = mse
+        
+        print(f"{stage}: {len(pids)}个患者, 5个网格点, MSE = {mse:.6f}")
+        print(f"  s范围: [{stage_s_min.item():.3f}, {stage_s_max.item():.3f}], 窗口大小: {window_size:.3f}")
+
+# 获取进程PID
+current_pid = os.getpid()
+
+# 追加到输出文件
+output_filename = f'results.out'
+with open(output_filename, 'a') as f:  # 使用追加模式 'a'
+    f.write(f"Process PID: {current_pid}\n")
+    f.write(f"CN MSE: {stage_mses.get('CN', 'N/A')}\n")
+    f.write(f"LMCI MSE: {stage_mses.get('LMCI', 'N/A')}\n")
+    f.write(f"AD MSE: {stage_mses.get('AD', 'N/A')}\n")
+
+
+print(f"\n结果已保存到文件: {output_filename}")
+print(f"进程PID: {current_pid}")
+print(f"CN MSE: {stage_mses.get('CN', 'N/A')}")
+print(f"LMCI MSE: {stage_mses.get('LMCI', 'N/A')}")
+print(f"AD MSE: {stage_mses.get('AD', 'N/A')}")
