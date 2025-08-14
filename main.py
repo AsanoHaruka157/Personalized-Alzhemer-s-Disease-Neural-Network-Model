@@ -9,7 +9,7 @@ import pccmnn as pc
 import os
 from torch.utils.data import Dataset, DataLoader
 
-# ------------------ 你已有的部分 ------------------
+# ------------------ 加载数据 ------------------
 csf_dict = pc.load_csf_data()
 
 keys_to_delete = []
@@ -63,53 +63,54 @@ B = torch.quantile(all_y_data, 0.05, dim=0)  # 5分位数
 C = torch.quantile(all_y_data, 0.50, dim=0)  # 50分位数（中位数）
 D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
 
-class PopulationODE(nn.Module):
+name = 'lstm'
+
+class PopulationLSTM(nn.Module):
     def __init__(self, hidden_dim=32):
         super().__init__()
-        
-        # 1. 活动网络 - 现在接受5个输入：4个生物标记物 + s值
-        self.net = nn.Sequential(
-            nn.Linear(5, hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(),
+        self.lstm = nn.LSTMCell(input_size=5, hidden_size=hidden_dim)
+        self.out = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 4),
-            nn.Sigmoid(),
-            nn.Dropout(),
+            nn.Sigmoid()
         )
-        # 新增：A为可学习参数
         self.A = nn.Parameter(torch.zeros(4, dtype=torch.float32))
 
-    def f(self, y, s):
-        y = y.float()
-        s = s.float()
-        # 确保s是标量，将其扩展为与y兼容的形状
-        if s.dim() == 0:  # s是标量
-            s_expanded = s.unsqueeze(0)  # 变成[1]
-        else:
-            s_expanded = s
-        # 将y和s连接起来作为网络输入
-        z = torch.cat([y, s_expanded], dim=0)  # 连接为[5]的向量
-        net_output = self.net(z.unsqueeze(0))  # 添加batch维度 -> [1, 5] -> [1, 4]
-        net_output = net_output.squeeze(0)  # 移除batch维度 -> [4]
-        result = 1e-2*torch.sigmoid(y)*(self.A-torch.sigmoid(y))*net_output
-        return result
+    # 不要加 @torch.jit.ignore
+    def _step(self, y: torch.Tensor, s: torch.Tensor, h_c: tuple):
+        if s.dim() == 0:
+            s = s.unsqueeze(0)
+        z = torch.cat([y, s], dim=0).unsqueeze(0)     # [1,5]
+        h, c = self.lstm(z, h_c)                      # [1,H], [1,H]
+        g = self.out(h).squeeze(0)                    # [4]
+        dyds = 1e-2 * torch.sigmoid(y) * (self.A - torch.sigmoid(y)) * g
+        #dyds = g
+        return dyds, (h, c)
 
-    def forward(self, s_grid, y0):
-        # 4th-order Runge-Kutta integration to solve the ODE
+    @torch.jit.export
+    def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        device = y.device
+        h0 = torch.zeros(1, self.lstm.hidden_size, dtype=y.dtype, device=device)
+        c0 = torch.zeros(1, self.lstm.hidden_size, dtype=y.dtype, device=device)
+        dyds, _ = self._step(y.float(), s.float(), (h0, c0))
+        return dyds
+
+    def forward(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
+        device = y0.device
+        h = torch.zeros(1, self.lstm.hidden_size, dtype=y0.dtype, device=device)
+        c = torch.zeros(1, self.lstm.hidden_size, dtype=y0.dtype, device=device)
         ys = [y0]
         for i in range(1, len(s_grid)):
-            h = s_grid[i] - s_grid[i-1]
-            y_i = ys[-1]
-            
-            k1 = self.f(y_i, s_grid[i-1])
-            k2 = self.f(y_i + 0.5 * h * k1, s_grid[i-1])
-            k3 = self.f(y_i + 0.5 * h * k2, s_grid[i-1])
-            k4 = self.f(y_i + h * k3, s_grid[i-1])
-            
-            y_next = y_i + (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+            s_prev = s_grid[i-1]
+            ds = s_grid[i] - s_grid[i-1]
+            y_prev = ys[-1]
+            dyds, (h, c) = self._step(y_prev, s_prev, (h, c))
+            y_next = y_prev + ds * dyds
             ys.append(y_next)
-            
-        return torch.stack(ys)          # (len_s, 4)
+        return torch.stack(ys)
+
 
 def calculate_sequential_loss(model, dat, ab_pid_theta, sigma=None):
     """
@@ -243,7 +244,7 @@ def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None, reg_lambda_smo
     one = torch.ones(4)
     # 为f函数调用提供s值，这里使用0作为默认值
     s_default = torch.tensor(0.0)
-    combined_loss = ( loss_global + res ) * (torch.norm(model.f(B, s_default)) + torch.norm(model.f(D, s_default))) / (torch.norm(model.f(C, s_default)) + 1e-2)
+    combined_loss = ( loss_global + res ) * torch.exp(torch.norm(model.f(B, s_default)) + torch.norm(model.f(D, s_default))) / (torch.norm(model.f(C, s_default)) + 1e-5)
         
     if reg_lambda_smooth > 0:
         alpha = torch.exp(ab_pid_theta[0]) + 1e-4
@@ -272,12 +273,12 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
-        n_adam      = 80,      # adam 阶段迭代次数
-        n_lbfgs    = 20,     # lbfgs 阶段迭代次数
+        n_adam      = 120,      # adam 阶段迭代次数
+        n_lbfgs    = 10,     # lbfgs 阶段迭代次数
         adam_lr_w    = 1e-2,
         adam_lr_ab   = 1e-3,
-        lbfgs_lr_w   = 1e-2,
-        lbfgs_lr_ab  = 1e-2,
+        lbfgs_lr_w   = 1e-4,
+        lbfgs_lr_ab  = 1e-4,
         batch_size=128,
         weighted_sampling=True,
         max_lbfgs_it = 10,
@@ -285,7 +286,7 @@ def fit_population(
         tolerance_change = 0,
         reg_lambda_alpha=1e-2,
         reg_lambda_smooth=0.,
-        early_stop_patience=100,
+        early_stop_patience=80,
         early_stop_threshold=0.001):
     
     # ---------- 计算每个生物标记物的全局方差以调整权重 ----------
@@ -295,7 +296,7 @@ def fit_population(
     sigma = sigma.clamp_min(1e-8)
 
     # ---------- 初始化 ----------
-    model = PopulationODE(hidden_dim=16)
+    model = PopulationLSTM(hidden_dim=32)
     def weights_init(m):
         if isinstance(m, nn.Linear):
             nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
@@ -371,7 +372,7 @@ def fit_population(
     opt_w_adam  = optim.Adam(model.parameters(), lr=adam_lr_w, weight_decay=1e-4)
     opt_ab_adam = {pid: optim.Adam([ab[pid]['theta']], lr=adam_lr_ab)
                    for pid in ab}
-    scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=[200,300,400,500,600,700,800,900,1000], gamma=0.5, last_epoch=-1)
+    scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=list(range(60, 151)), gamma=0.99, last_epoch=-1)
     opt_w_lbfgs = optim.LBFGS(model.parameters(), 
                                 lr=lbfgs_lr_w,
                                 max_iter=max_lbfgs_it, 
@@ -607,7 +608,10 @@ model_fix, ab_dict = fit_population(
 
 current_pid = os.getpid()
 # Use the .save() method for JIT-scripted models
-model_fix.save(f'model_{current_pid}.pt')
+try:
+    torch.save(model_fix, f'model_{name}_{current_pid}.pt')
+except Exception as e:
+    print(f"Error saving model: {e} 喵！   _(┐ ◟;ﾟдﾟ)ノ")
 
 # ---------- 2. 绘制人群四联图 (根据s的5%和95%分位数) -----------------
 # -------- 计算所有s值并确定分位数 ---------
@@ -708,6 +712,13 @@ with torch.no_grad():
         q10, q90 = None, None
 # --- 结束计算 ---
 
+# ---------- 添加新轨迹：从平均初值开始的完整轨迹（不使用窗口） ----------
+with torch.no_grad():
+    # 使用平均初值作为起点
+    y_curve_full = model_fix(s_curve, y0_pop)
+    y_curve_full = y_curve_full.detach().numpy()
+
+print(f"添加了从平均初值开始的完整轨迹")
 
 TITLES = ['Aβ (A)', 'p-Tau (T)', 'Neurodeg. (N)', 'Cognition (C)']
 
@@ -737,56 +748,20 @@ for k, ax in enumerate(axes.flat):
     # --- 曲线 (基于局部均值的逐步预测轨迹) ---
     ax.plot(s_curve, y_curve[:, k], lw=1.5, c='black', label='Local Mean Stepwise Trajectory')
     
+    # --- 新轨迹 (从平均初值开始的完整轨迹) ---
+    ax.plot(s_curve, y_curve_full[:, k], lw=1.5, c='red', linestyle='--', label='Full Trajectory from Mean Initial')
+    
     # --- 置信区间 ---
     if q10 is not None and q90 is not None:
         ax.fill_between(s_curve, q10[:, k], q90[:, k], color='gray', alpha=0.3, label='Confidence Interval')
 
     ax.set_xlabel('Disease progression score  s')
     ax.set_ylabel(TITLES[k])
-    ax.legend()
+    ax.legend(fontsize=8)
 
 fig2.suptitle(f'Population biomarker trajectories - Local Mean Stepwise Prediction (s in [{s_min.item():.2f}, {s_max.item():.2f}])')
 plt.tight_layout(rect=[0,0,1,0.96])
-plt.savefig(f'result_{current_pid}.png')
-
-'''
-# ---------- 为 alpha vs. MSE 散点图计算最终 MSE ----------
-final_mses = {}
-with torch.no_grad():
-    all_biomarkers = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
-    sigma = all_biomarkers.var(dim=0).clamp_min(1e-8)
-
-    # 为计算损失，将 alpha, beta 转回 theta
-    ab_theta_final = {}
-    for pid, (alpha, beta) in ab_dict.items():
-        theta0 = torch.log(torch.tensor(alpha) - 1e-4)
-        theta1 = torch.tensor(beta)
-        ab_theta_final[pid] = torch.tensor([theta0.item(), theta1.item()])
-
-    for pid, dat in patient_data.items():
-        if dat['t'].shape[0] >= 2:
-            mse = calculate_combined_loss(model_fix, dat, ab_theta_final[pid], sigma)
-            final_mses[pid] = mse.item()
-
-# 提取 alpha 值
-alphas = {pid: val[0] for pid, val in ab_dict.items()}
-
-# 准备绘图数据
-pids_list = list(final_mses.keys())
-mse_values = [final_mses[p] for p in pids_list]
-alpha_values = [alphas[p] for p in pids_list]
-
-# 绘制 alpha vs. MSE 散点图
-fig_alpha_mse, ax_alpha_mse = plt.subplots(figsize=(8, 6))
-ax_alpha_mse.scatter(alpha_values, mse_values, alpha=0.6)
-ax_alpha_mse.set_xlabel('Alpha')
-ax_alpha_mse.set_ylabel('Final MSE')
-ax_alpha_mse.set_title('Alpha vs. Final MSE for each patient')
-ax_alpha_mse.grid(True)
-plt.tight_layout()
-plt.savefig(f'alpha_mse_{current_pid}.png')
-plt.show()
-'''
+plt.savefig(f'result_{name}_{current_pid}.png')
 
 # ---------- 计算CN、LMCI、AD三个数据集上的标准MSE ----------
 print("\n计算各阶段的标准MSE...")
