@@ -63,24 +63,40 @@ B = torch.quantile(all_y_data, 0.05, dim=0)  # 5分位数
 C = torch.quantile(all_y_data, 0.50, dim=0)  # 50分位数（中位数）
 D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
 
-name = 'resnet'
+name = 'gatedrnn'
 
-class ResidualBlock(nn.Module):
-    """残差块"""
-    def __init__(self, dim):
+class GatedRNNCell(nn.Module):
+    """门控RNN单元"""
+    def __init__(self, input_size, hidden_size):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.Tanh(),
-            nn.Dropout(0.1),
-            nn.Linear(dim, dim),
-        )
+        self.hidden_size = hidden_size
         
-    def forward(self, x):
-        return x + self.block(x)  # 残差连接
+        # 输入门
+        self.input_gate = nn.Linear(input_size + hidden_size, hidden_size)
+        # 遗忘门
+        self.forget_gate = nn.Linear(input_size + hidden_size, hidden_size)
+        # 候选隐藏状态
+        self.candidate = nn.Linear(input_size + hidden_size, hidden_size)
+        # 输出门
+        self.output_gate = nn.Linear(input_size + hidden_size, hidden_size)
+        
+    def forward(self, x, h_prev):
+        # 连接输入和前一隐藏状态
+        combined = torch.cat([x, h_prev], dim=-1)
+        
+        # 计算门控值
+        i_t = torch.sigmoid(self.input_gate(combined))
+        f_t = torch.sigmoid(self.forget_gate(combined))
+        c_tilde = torch.tanh(self.candidate(combined))
+        o_t = torch.sigmoid(self.output_gate(combined))
+        
+        # 更新隐藏状态
+        h_t = o_t * torch.tanh(c_tilde)
+        
+        return h_t
 
-class PopulationResNet(nn.Module):
-    def __init__(self, hidden_dim=32, num_residual_blocks=2):
+class PopulationGatedRNN(nn.Module):
+    def __init__(self, hidden_dim=32, num_layers=2):
         super().__init__()
         
         # 1. 输入层：5个输入（4个生物标记物 + s值）-> hidden_dim
@@ -88,9 +104,9 @@ class PopulationResNet(nn.Module):
         self.input_activation = nn.Tanh()
         self.input_dropout = nn.Dropout(0.1)
         
-        # 2. 残差块序列
-        self.residual_blocks = nn.ModuleList([
-            ResidualBlock(hidden_dim) for _ in range(num_residual_blocks)
+        # 2. GatedRNN层
+        self.gated_rnn_layers = nn.ModuleList([
+            GatedRNNCell(hidden_dim, hidden_dim) for _ in range(num_layers)
         ])
         
         # 3. 输出层：hidden_dim -> 4个生物标记物
@@ -100,6 +116,9 @@ class PopulationResNet(nn.Module):
         
         # 4. A为可学习参数
         self.A = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        
+        # 5. 隐藏状态初始化
+        self.hidden_dim = hidden_dim
 
     def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         y = y.float()
@@ -113,7 +132,7 @@ class PopulationResNet(nn.Module):
         # 将y和s连接起来作为网络输入
         z = torch.cat([y, s_expanded], dim=0)  # 连接为[5]的向量
         
-        # 前向传播通过残差网络
+        # 前向传播通过门控RNN网络
         x = z.unsqueeze(0)  # 添加batch维度 -> [1, 5]
         
         # 输入层
@@ -121,9 +140,13 @@ class PopulationResNet(nn.Module):
         x = self.input_activation(x)
         x = self.input_dropout(x)
         
-        # 残差块序列
-        for residual_block in self.residual_blocks:
-            x = residual_block(x)
+        # 初始化隐藏状态
+        h = torch.zeros(1, self.hidden_dim, device=x.device)
+        
+        # GatedRNN层序列
+        for gated_rnn_layer in self.gated_rnn_layers:
+            h = gated_rnn_layer(x, h)
+            x = h  # 使用隐藏状态作为下一层的输入
         
         # 输出层
         x = self.output_layer(x)  # [1, 4]
@@ -338,7 +361,7 @@ def fit_population(
     sigma = sigma.clamp_min(1e-8)
 
     # ---------- 初始化 ----------
-    model = PopulationResNet(hidden_dim=32, num_residual_blocks=2)
+    model = PopulationGatedRNN(hidden_dim=32, num_layers=2)
     def weights_init(m):
         if isinstance(m, nn.Linear):
             nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
