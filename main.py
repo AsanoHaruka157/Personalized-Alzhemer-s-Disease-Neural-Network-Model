@@ -63,53 +63,95 @@ B = torch.quantile(all_y_data, 0.05, dim=0)  # 5分位数
 C = torch.quantile(all_y_data, 0.50, dim=0)  # 50分位数（中位数）
 D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
 
-name = 'lstm'
+name = 'resnet'
 
-class PopulationLSTM(nn.Module):
-    def __init__(self, hidden_dim=32):
+class ResidualBlock(nn.Module):
+    """残差块"""
+    def __init__(self, dim):
         super().__init__()
-        self.lstm = nn.LSTMCell(input_size=5, hidden_size=hidden_dim)
-        self.out = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 4),
-            nn.Sigmoid()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            nn.Linear(dim, dim),
         )
+        
+    def forward(self, x):
+        return x + self.block(x)  # 残差连接
+
+class PopulationResNet(nn.Module):
+    def __init__(self, hidden_dim=32, num_residual_blocks=2):
+        super().__init__()
+        
+        # 1. 输入层：5个输入（4个生物标记物 + s值）-> hidden_dim
+        self.input_layer = nn.Linear(5, hidden_dim)
+        self.input_activation = nn.Tanh()
+        self.input_dropout = nn.Dropout(0.1)
+        
+        # 2. 残差块序列
+        self.residual_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim) for _ in range(num_residual_blocks)
+        ])
+        
+        # 3. 输出层：hidden_dim -> 4个生物标记物
+        self.output_layer = nn.Linear(hidden_dim, 4)
+        self.output_activation = nn.Sigmoid()
+        self.output_dropout = nn.Dropout(0.1)
+        
+        # 4. A为可学习参数
         self.A = nn.Parameter(torch.zeros(4, dtype=torch.float32))
 
-    # 不要加 @torch.jit.ignore
-    def _step(self, y: torch.Tensor, s: torch.Tensor, h_c: tuple):
-        if s.dim() == 0:
-            s = s.unsqueeze(0)
-        z = torch.cat([y, s], dim=0).unsqueeze(0)     # [1,5]
-        h, c = self.lstm(z, h_c)                      # [1,H], [1,H]
-        g = self.out(h).squeeze(0)                    # [4]
-        dyds = 1e-2 * torch.sigmoid(y) * (self.A - torch.sigmoid(y)) * g
-        #dyds = g
-        return dyds, (h, c)
-
-    @torch.jit.export
     def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        device = y.device
-        h0 = torch.zeros(1, self.lstm.hidden_size, dtype=y.dtype, device=device)
-        c0 = torch.zeros(1, self.lstm.hidden_size, dtype=y.dtype, device=device)
-        dyds, _ = self._step(y.float(), s.float(), (h0, c0))
-        return dyds
+        y = y.float()
+        s = s.float()
+        # 确保s是标量，将其扩展为与y兼容的形状
+        if s.dim() == 0:  # s是标量
+            s_expanded = s.unsqueeze(0)  # 变成[1]
+        else:
+            s_expanded = s
+        
+        # 将y和s连接起来作为网络输入
+        z = torch.cat([y, s_expanded], dim=0)  # 连接为[5]的向量
+        
+        # 前向传播通过残差网络
+        x = z.unsqueeze(0)  # 添加batch维度 -> [1, 5]
+        
+        # 输入层
+        x = self.input_layer(x)  # [1, hidden_dim]
+        x = self.input_activation(x)
+        x = self.input_dropout(x)
+        
+        # 残差块序列
+        for residual_block in self.residual_blocks:
+            x = residual_block(x)
+        
+        # 输出层
+        x = self.output_layer(x)  # [1, 4]
+        x = self.output_activation(x)
+        x = self.output_dropout(x)
+        
+        net_output = x.squeeze(0)  # 移除batch维度 -> [4]
+        
+        # 应用ODE动力学
+        result = 1e-2*torch.sigmoid(y)*(self.A-torch.sigmoid(y))*net_output
+        return result
 
     def forward(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
-        device = y0.device
-        h = torch.zeros(1, self.lstm.hidden_size, dtype=y0.dtype, device=device)
-        c = torch.zeros(1, self.lstm.hidden_size, dtype=y0.dtype, device=device)
+        # 4th-order Runge-Kutta integration to solve the ODE
         ys = [y0]
         for i in range(1, len(s_grid)):
-            s_prev = s_grid[i-1]
-            ds = s_grid[i] - s_grid[i-1]
-            y_prev = ys[-1]
-            dyds, (h, c) = self._step(y_prev, s_prev, (h, c))
-            y_next = y_prev + ds * dyds
+            h = s_grid[i] - s_grid[i-1]
+            y_i = ys[-1]
+            
+            k1 = self.f(y_i, s_grid[i-1])
+            k2 = self.f(y_i + 0.5 * h * k1, s_grid[i-1])
+            k3 = self.f(y_i + 0.5 * h * k2, s_grid[i-1])
+            k4 = self.f(y_i + h * k3, s_grid[i-1])
+            
+            y_next = y_i + (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
             ys.append(y_next)
-        return torch.stack(ys)
+            
+        return torch.stack(ys)          # (len_s, 4)
 
 
 def calculate_sequential_loss(model, dat, ab_pid_theta, sigma=None):
@@ -296,7 +338,7 @@ def fit_population(
     sigma = sigma.clamp_min(1e-8)
 
     # ---------- 初始化 ----------
-    model = PopulationLSTM(hidden_dim=32)
+    model = PopulationResNet(hidden_dim=32, num_residual_blocks=2)
     def weights_init(m):
         if isinstance(m, nn.Linear):
             nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
