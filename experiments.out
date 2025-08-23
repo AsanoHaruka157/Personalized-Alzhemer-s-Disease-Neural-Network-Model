@@ -1,0 +1,20 @@
+fnnTime: 2025-08-21 23:52:14
+Evaluation with loaded fnn.pthModel structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=5, out_features=32, bias=True)
+    (1): Sigmoid()
+    (2): Linear(in_features=32, out_features=4, bias=True)
+    (3): Sigmoid()
+  )
+)MSE: 0.0491fnnTime: 2025-08-23 16:06:38
+Evaluation with loaded fnn.pthModel structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=5, out_features=32, bias=True)
+    (1): Tanh()
+    (2): Linear(in_features=32, out_features=32, bias=True)
+    (3): Tanh()
+    (4): Linear(in_features=32, out_features=4, bias=True)
+  )
+)MSE: 0.1850
