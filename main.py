@@ -48,7 +48,7 @@ B = torch.quantile(all_y_data, 0.05, dim=0)  # 5分位数
 C = torch.quantile(all_y_data, 0.50, dim=0)  # 50分位数（中位数）
 D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
 
-Message = f"This is a simple FNN model with activation Tanh"
+Message = f"This is a hybrid model with polynomial terms and FNN with activation Tanh"
 name = 'fnn'
 
 class ODEModel(nn.Module):
@@ -64,6 +64,13 @@ class ODEModel(nn.Module):
             nn.Linear(hidden_dim, 4),
             nn.Sigmoid()
         )
+        
+        # 2. 多项式系数：15个可学习参数
+        # g(y0) = a0*y0^2 + a1*y0 + a2
+        # g(y1) = b0*y1^2 + b1*y0*y1 + b2*y1 + b3
+        # g(y2) = c0*y2^2 + c1*y1*y2 + c2*y2 + c3
+        # g(y3) = d0*y3^2 + d1*y2*y3 + d2*y3 + d3
+        self.poly_coeffs = nn.Parameter(torch.zeros(15))  # 初始化15个系数
 
 
     def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -78,9 +85,28 @@ class ODEModel(nn.Module):
         # 将y和s连接起来作为网络输入
         z = torch.cat([y, s_expanded], dim=0)  # 连接为[5]的向量
         
-        z = self.net(z)
+        # 神经网络部分
+        net_output = self.net(z)
         
-        return z
+        # 多项式部分 g(y)
+        y0, y1, y2, y3 = y[0], y[1], y[2], y[3]
+        
+        # 提取多项式系数
+        a0, a1, a2 = self.poly_coeffs[0], self.poly_coeffs[1], self.poly_coeffs[2]
+        b0, b1, b2, b3 = self.poly_coeffs[3], self.poly_coeffs[4], self.poly_coeffs[5], self.poly_coeffs[6]
+        c0, c1, c2, c3 = self.poly_coeffs[7], self.poly_coeffs[8], self.poly_coeffs[9], self.poly_coeffs[10]
+        d0, d1, d2, d3 = self.poly_coeffs[11], self.poly_coeffs[12], self.poly_coeffs[13], self.poly_coeffs[14]
+        
+        # 计算多项式项
+        g0 = a0 * y0**2 + a1 * y0 + a2
+        g1 = b0 * y1**2 + b1 * y0 * y1 + b2 * y1 + b3
+        g2 = c0 * y2**2 + c1 * y1 * y2 + c2 * y2 + c3
+        g3 = d0 * y3**2 + d1 * y2 * y3 + d2 * y3 + d3
+        
+        g_y = torch.stack([g0, g1, g2, g3])
+        
+        # 最终输出：f(y,s) = g(y) + net(y,s)
+        return g_y + net_output
 
     def forward(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
         # 4th-order Runge-Kutta integration to solve the ODE
@@ -135,7 +161,7 @@ def residual(model, dat, ab_pid_theta, sigma=None):
     residual = dy_dt - fy
     loss = residual ** 2
     if sigma is not None:
-        loss = loss / sigma
+        loss = loss * sigma
     return loss.mean()
 
 
@@ -159,7 +185,7 @@ def calculate_global_loss(model, dat, ab_pid_theta, sigma=None):
     
     loss = (y_pred_trajectory - y_actual_trajectory)**2
     if sigma is not None:
-        loss = loss / sigma
+        loss = loss * sigma
         
     return loss.mean()
 
@@ -197,12 +223,13 @@ def fit_population(
         patient_data,
         n_adam      = 120,      # adam 阶段迭代次数
         n_lbfgs    = 0,     # lbfgs 阶段迭代次数
-        adam_lr_w    = 1e-2,
+        adam_lr_w    = 5e-3,
         adam_lr_ab   = 1e-4,
         lbfgs_lr_w   = 1e-2,
         lbfgs_lr_ab  = 1e-2,
         batch_size=128,
         weighted_sampling=True,
+        delta = 30,
         max_lbfgs_it = 10,
         tolerance_grad = 0,
         tolerance_change = 0,
@@ -293,84 +320,113 @@ def fit_population(
     early_stop_counter = 0
     last_adam_loss = float('inf')
     adam_loss_history = []
+    
+    # 模型备份相关变量
+    model_backup = None
+    ab_backup = None
+    backup_iter = 0
 
-    for it in range(n_adam + n_lbfgs):
-        use_adam = it < n_adam
-
-        # ======================== 更新 w =========================
-        if use_adam:
-            if use_minibatch:
-                try:
-                    batch_pids = next(batch_iterator)
-                except StopIteration:
-                    print("Batch iterator exhausted. This should not happen with the configured sampler.")
-                    continue
-            else:
-                batch_pids = patient_pids
-
-            opt_w_adam.zero_grad()
-            loss_w = 0.
-            
-            # Convert tensor PIDs to integer for dict lookup
-            batch_pids_list = [pid.item() for pid in batch_pids] if use_minibatch else batch_pids
-            valid_pids_in_batch = [pid for pid in batch_pids_list if patient_data[pid]['t'].shape[0] >= 2]
-            
-            if not valid_pids_in_batch:
+    # 交替更新：Adam更新w 10轮，然后L-BFGS更新a,b一轮
+    for it in range(n_adam):
+        # ======================== 更新 w (Adam) =========================
+        if use_minibatch:
+            try:
+                batch_pids = next(batch_iterator)
+            except StopIteration:
+                print("Batch iterator exhausted. This should not happen with the configured sampler.")
                 continue
+        else:
+            batch_pids = patient_pids
 
-            for pid in valid_pids_in_batch:
-                dat = patient_data[pid]
-                loss_w += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
-            
-            if len(valid_pids_in_batch) > 0:
-                loss_w /= len(valid_pids_in_batch)
+        opt_w_adam.zero_grad()
+        loss_w = 0.
+        
+        # Convert tensor PIDs to integer for dict lookup
+        batch_pids_list = [pid.item() for pid in batch_pids] if use_minibatch else batch_pids
+        valid_pids_in_batch = [pid for pid in batch_pids_list if patient_data[pid]['t'].shape[0] >= 2]
+        
+        if not valid_pids_in_batch:
+            continue
 
-            # --- Early stopping and logging with moving average ---
-            adam_loss_history.append(loss_w.item())
-            if len(adam_loss_history) > 30: # Moving average window
-                adam_loss_history.pop(0)
-            current_avg_loss = sum(adam_loss_history) / len(adam_loss_history)
+        for pid in valid_pids_in_batch:
+            dat = patient_data[pid]
+            loss_w += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
+        
+        if len(valid_pids_in_batch) > 0:
+            loss_w /= len(valid_pids_in_batch)
 
-            # --- Early stopping logic ---
-            if last_adam_loss != float('inf'):
-                relative_change = (last_adam_loss - current_avg_loss) / abs(last_adam_loss) if last_adam_loss != 0 else float('inf')
-                if relative_change < early_stop_threshold:
-                    early_stop_counter += 1
-                else:
-                    early_stop_counter = 0
-            last_adam_loss = current_avg_loss
+        # --- Early stopping and logging with moving average ---
+        adam_loss_history.append(loss_w.item())
+        if len(adam_loss_history) > 30: # Moving average window
+            adam_loss_history.pop(0)
+        current_avg_loss = sum(adam_loss_history) / len(adam_loss_history)
 
-            if early_stop_counter >= early_stop_patience:
-                print(f"Iter {it+1:02d}: Early stopping. Loss improvement < {early_stop_threshold*100:.1f}% for {early_stop_patience} steps.")
-                break
-            # --- End early stopping logic ---
-
-            if torch.isnan(loss_w):
-                print(f"Iter {it+1:02d}: Adam loss for w is NaN. Stopping training.")
-                training_stopped = True
+        # --- Early stopping logic ---
+        if last_adam_loss != float('inf'):
+            relative_change = (last_adam_loss - current_avg_loss) / abs(last_adam_loss) if last_adam_loss != 0 else float('inf')
+            if relative_change < early_stop_threshold:
+                early_stop_counter += 1
             else:
-                loss_w.backward()
-                opt_w_adam.step()
-                scheduler.step()
-        else:  # L-BFGS
-            # Reset early stopping state when not using Adam
-            early_stop_counter = 0
-            last_adam_loss = float('inf')
+                early_stop_counter = 0
+        last_adam_loss = current_avg_loss
 
-            def closure_w():
-                opt_w_lbfgs.zero_grad()
-                loss = 0.
-                for pid, dat in patient_data.items():
-                    loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
-                    loss = loss / len(patient_data)
-                if not torch.isnan(loss):
-                    loss.backward()
-                return loss
-            loss_w = opt_w_lbfgs.step(closure_w)
+        if early_stop_counter >= early_stop_patience:
+            print(f"Iter {it+1:02d}: Early stopping. Loss improvement < {early_stop_threshold*100:.1f}% for {early_stop_patience} steps.")
+            break
+        # --- End early stopping logic ---
 
-            if torch.isnan(loss_w):
-                print(f"Iter {it+1:02d}: L-BFGS loss for w is NaN. Stopping training.")
-                training_stopped = True
+        if torch.isnan(loss_w):
+            print(f"Iter {it+1:02d}: Adam loss for w is NaN. Stopping training.")
+            training_stopped = True
+        else:
+            loss_w.backward()
+            opt_w_adam.step()
+            scheduler.step()
+
+        # ====================== 每delta轮更新一次 α,β (L-BFGS) ==========================
+        if (it + 1) % delta == 0:
+            print(f"Iter {it+1:02d}: Updating α,β with L-BFGS...")
+            
+            # 保存模型和ab的备份
+            model_backup = copy.deepcopy(model.state_dict())
+            ab_backup = {pid: ab[pid]['theta'].clone() for pid in ab}
+            backup_iter = it + 1
+            print(f"Iter {it+1:02d}: Model backup saved.")
+            
+            # 使用所有患者数据更新a,b
+            nan_detected = False
+            for pid in patient_data.keys():
+                dat = patient_data[pid]
+                if dat['t'].shape[0] < 2:
+                    continue
+
+                def closure_ab():
+                    opt_ab_lbfgs[pid].zero_grad()
+                    loss = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
+                    if not torch.isnan(loss):
+                        loss.backward()
+                    return loss
+                
+                try:
+                    loss_ab = opt_ab_lbfgs[pid].step(closure_ab)
+                    if torch.isnan(loss_ab):
+                        print(f"Iter {it+1:02d}: L-BFGS loss for α,β for pid {pid} is NaN.")
+                        nan_detected = True
+                        break
+                except Exception as e:
+                    print(f"Iter {it+1:02d}: L-BFGS failed for pid {pid}: {e}")
+                    nan_detected = True
+                    break
+            
+            # 如果检测到NaN，恢复备份
+            if nan_detected:
+                print(f"Iter {it+1:02d}: NaN detected, restoring model from backup (iter {backup_iter}).")
+                model.load_state_dict(model_backup)
+                for pid in ab:
+                    ab[pid]['theta'] = ab_backup[pid].clone()
+                print(f"Iter {it+1:02d}: Model restored successfully.")
+            else:
+                print(f"Iter {it+1:02d}: L-BFGS update completed successfully.")
 
         if training_stopped:
             break
@@ -401,75 +457,20 @@ def fit_population(
             else:
                 sigma = torch.ones(4) # Fallback if no residuals calculated
 
-
-        # ====================== 更新 α,β ==========================
-        if use_adam:
-            current_pids_for_ab = valid_pids_in_batch
-        elif use_minibatch: # LBFGS with minibatch
-            current_pids_for_ab = valid_pids_in_batch
-        else: # LBFGS full batch
-            current_pids_for_ab = patient_data.keys()
-            
-        for pid in current_pids_for_ab:
-            dat = patient_data[pid]
-            if dat['t'].shape[0] < 2:
-                continue
-
-            if use_adam:
-                opt_ab_adam[pid].zero_grad()
-                loss_ab = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
-
-                if torch.isnan(loss_ab):
-                    print(f"Iter {it+1:02d}: Adam loss for α,β for pid {pid} is NaN. Stopping training.")
-                    training_stopped = True
-                    break
-                loss_ab.backward()
-                opt_ab_adam[pid].step()
-            else:  # L-BFGS
-                def closure_ab():
-                    opt_ab_lbfgs[pid].zero_grad()
-                    loss = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
-                    if not torch.isnan(loss):
-                        loss.backward()
-                    return loss
-                loss_ab = opt_ab_lbfgs[pid].step(closure_ab)
-
-                if torch.isnan(loss_ab):
-                    print(f"Iter {it+1:02d}: L-BFGS loss for α,β for pid {pid} is NaN. Stopping training.")
-                    training_stopped = True
-                    break
-        
-        if training_stopped:
-            break
-
         # ----------- 监控 ----------
         if (it+1) % 1 == 0:
-            if use_adam:
-                print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
-                      f"Adam | "
-                      f"Batch MSE={loss_w.item():.4f} | "
-                      f"Avg MSE={current_avg_loss:.4f}")
-            else: # L-BFGS logging
-                if use_minibatch:
-                    print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
-                          f"LBFGS | "
-                          f"MSE={loss_w.item():.4f}")
-                else:
-                    with torch.no_grad():
-                        total_loss = 0.
-                        num_patients = 0
-                        for pid, dat in patient_data.items():
-                            if dat['t'].shape[0] >= 2:
-                                total_loss += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
-                                num_patients += 1
-                        
-                        mean_loss = total_loss / num_patients if num_patients > 0 else 0.
-                    print(f"iter {it+1:02d}/{n_adam+n_lbfgs} | "
-                        f"LBFGS | "
-                        f"MSE={mean_loss.item():.4f}")
+            print(f"iter {it+1:02d}/{n_adam} | "
+                  f"Adam | "
+                  f"Batch MSE={loss_w.item():.4f} | "
+                  f"Avg MSE={current_avg_loss:.4f}")
 
     # --------- 输出 ----------
     model.eval() # Switch to evaluation mode before returning
+    
+    # 检查是否使用了备份模型
+    if model_backup is not None:
+        print(f"Training completed. Last backup was saved at iteration {backup_iter}.")
+    
     alpha_beta = {pid: (float(torch.exp(v['theta'][0])+1e-4),
                         float(v['theta'][1]))
                   for pid, v in ab.items()}
@@ -483,28 +484,39 @@ try:
 except Exception as e:
     print(f"Error saving model: {e} 喵！   _(┐ ◟;ﾟдﾟ)ノ")
 
-# ---------- 2. 绘制人群四联图 (根据s的5%和95%分位数) -----------------
-s_min = -10
-s_max = 20
+# ---------- 2. 绘制人群四联图 (根据s的10%和90%分位数) -----------------
+# 收集所有患者的s值
+all_s_values = []
+for p in patient_data:
+    s_values = ab_dict[p][0] * patient_data[p]['t'] + ab_dict[p][1]
+    all_s_values.append(s_values)
+
+# 计算所有s值的10分位数和90分位数
+all_s_flat = torch.cat(all_s_values)
+s_10_percentile = torch.quantile(all_s_flat, 0.10)
+s_90_percentile = torch.quantile(all_s_flat, 0.90)
+
+print(f"S value range: 10th percentile = {s_10_percentile:.2f}, 90th percentile = {s_90_percentile:.2f}")
+
+# 使用10分位数到90分位数的范围
+s_min = s_10_percentile
+s_max = s_90_percentile
 s_curve = torch.linspace(s_min, s_max, 100)
-# -------- 根据s的分位数范围过滤病例 ---------
+
+# 过滤在10-90分位数范围内的数据点
 keep = []
 for p in patient_data:
     s_values = ab_dict[p][0] * patient_data[p]['t'] + ab_dict[p][1]
-    if s_values.min() >= s_min and s_values.max() <= s_max:
+    # 检查是否有任何s值在范围内
+    if torch.any((s_values >= s_min) & (s_values <= s_max)):
         keep.append(p)
 
 stage_dict = pc.load_stage_dict()
 
-# 准备绘图数据
-if not keep:
-    print("Warning: No patients left after filtering by s-quantiles. Plot will only show the mean trajectory based on all patients.")
-    # Fallback to avoid crashing: use all patients for y0_pop
-    y0_pop = torch.tensor([0.1,0,0,0])
-else:
-    y0_pop = torch.tensor([0.1,0,0,0])
+# 准备绘图数据 - 使用10分位数对应的y值作为起始点
+y0_pop = torch.tensor([0.1,0,0,0])
 
-# ---------- 添加新轨迹：从平均初值开始的完整轨迹（不使用窗口） ----------
+# ---------- 添加新轨迹：从10分位数开始的完整轨迹 ----------
 with torch.no_grad():
     y_curve_full = model(s_curve, y0_pop)
     y_curve_full = y_curve_full.detach().numpy()
@@ -524,8 +536,14 @@ for k, ax in enumerate(axes.flat):
         if stage not in s_by_stage:
             stage = 'Other'
         
-        s_by_stage[stage].append(a * patient_data[p]['t'] + b)
-        y_by_stage[stage].append(patient_data[p]['y'][:, k])
+        s_values = a * patient_data[p]['t'] + b
+        y_values = patient_data[p]['y'][:, k]
+        
+        # 只保留在10-90分位数范围内的数据点
+        mask = (s_values >= s_min) & (s_values <= s_max)
+        if torch.any(mask):
+            s_by_stage[stage].append(s_values[mask])
+            y_by_stage[stage].append(y_values[mask])
 
     # --- 绘制散点 (分期颜色) ---
     colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
@@ -544,7 +562,7 @@ for k, ax in enumerate(axes.flat):
     ax.set_ylabel(TITLES[k])
     ax.legend(fontsize=8)
 
-fig2.suptitle(f'Population Model (s in [{float(s_min):.2f}, {float(s_max):.2f}])')
+fig2.suptitle(f'Population Model (s in 10-90 percentile: [{float(s_min):.2f}, {float(s_max):.2f}])')
 plt.tight_layout(rect=[0,0,1,0.96])
 plt.savefig(f'{name}.png')
 

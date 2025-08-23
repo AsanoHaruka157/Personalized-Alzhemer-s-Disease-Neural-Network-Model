@@ -17,4 +17,82 @@ ODEModel(
     (3): Tanh()
     (4): Linear(in_features=32, out_features=4, bias=True)
   )
-)MSE: 0.1850
+)MSE: 0.1850fnnTime: 2025-08-23 16:31:55
+This is a simple FNN model with activation TanhModel structure:
+RecursiveScriptModule(
+  original_name=ODEModel
+  (net): RecursiveScriptModule(
+    original_name=Sequential
+    (0): RecursiveScriptModule(original_name=Linear)
+    (1): RecursiveScriptModule(original_name=Tanh)
+    (2): RecursiveScriptModule(original_name=Linear)
+    (3): RecursiveScriptModule(original_name=Tanh)
+    (4): RecursiveScriptModule(original_name=Linear)
+    (5): RecursiveScriptModule(original_name=Sigmoid)
+  )
+)MSE: 0.0320fnnTime: 2025-08-23 16:44:18
+This is a simple FNN model with activation TanhModel structure:
+RecursiveScriptModule(
+  original_name=ODEModel
+  (net): RecursiveScriptModule(
+    original_name=Sequential
+    (0): RecursiveScriptModule(original_name=Linear)
+    (1): RecursiveScriptModule(original_name=Tanh)
+    (2): RecursiveScriptModule(original_name=Linear)
+    (3): RecursiveScriptModule(original_name=Tanh)
+    (4): RecursiveScriptModule(original_name=Linear)
+    (5): RecursiveScriptModule(original_name=Sigmoid)
+  )
+)MSE: 0.0345fnnTime: 2025-08-23 17:53:47
+This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
+RecursiveScriptModule(
+  original_name=ODEModel
+  (net): RecursiveScriptModule(
+    original_name=Sequential
+    (0): RecursiveScriptModule(original_name=Linear)
+    (1): RecursiveScriptModule(original_name=Tanh)
+    (2): RecursiveScriptModule(original_name=Linear)
+    (3): RecursiveScriptModule(original_name=Tanh)
+    (4): RecursiveScriptModule(original_name=Linear)
+    (5): RecursiveScriptModule(original_name=Sigmoid)
+  )
+)MSE: nanfnnTime: 2025-08-23 18:12:39
+This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
+RecursiveScriptModule(
+  original_name=ODEModel
+  (net): RecursiveScriptModule(
+    original_name=Sequential
+    (0): RecursiveScriptModule(original_name=Linear)
+    (1): RecursiveScriptModule(original_name=Tanh)
+    (2): RecursiveScriptModule(original_name=Linear)
+    (3): RecursiveScriptModule(original_name=Tanh)
+    (4): RecursiveScriptModule(original_name=Linear)
+    (5): RecursiveScriptModule(original_name=Sigmoid)
+  )
+)MSE: nanfnnTime: 2025-08-23 18:25:18
+This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
+RecursiveScriptModule(
+  original_name=ODEModel
+  (net): RecursiveScriptModule(
+    original_name=Sequential
+    (0): RecursiveScriptModule(original_name=Linear)
+    (1): RecursiveScriptModule(original_name=Tanh)
+    (2): RecursiveScriptModule(original_name=Linear)
+    (3): RecursiveScriptModule(original_name=Tanh)
+    (4): RecursiveScriptModule(original_name=Linear)
+    (5): RecursiveScriptModule(original_name=Sigmoid)
+  )
+)MSE: 0.0356fnnTime: 2025-08-23 18:33:25
+This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
+RecursiveScriptModule(
+  original_name=ODEModel
+  (net): RecursiveScriptModule(
+    original_name=Sequential
+    (0): RecursiveScriptModule(original_name=Linear)
+    (1): RecursiveScriptModule(original_name=Tanh)
+    (2): RecursiveScriptModule(original_name=Linear)
+    (3): RecursiveScriptModule(original_name=Tanh)
+    (4): RecursiveScriptModule(original_name=Linear)
+    (5): RecursiveScriptModule(original_name=Sigmoid)
+  )
+)MSE: 0.0591
