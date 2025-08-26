@@ -48,65 +48,67 @@ B = torch.quantile(all_y_data, 0.05, dim=0)  # 5分位数
 C = torch.quantile(all_y_data, 0.50, dim=0)  # 50分位数（中位数）
 D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
 
-Message = f"This is a hybrid model with polynomial terms and FNN with activation Tanh"
+Message = f"This is a simple FNN model with fixed pretrained DPS parameters."
 name = 'fnn'
 
 class ODEModel(nn.Module):
     def __init__(self, hidden_dim=32, num_layers=2):
         super().__init__()
-
-        # 1. 输入层：5个输入（4个生物标记物 + s值）-> hidden_dim
         self.net = nn.Sequential(
-            nn.Linear(5, hidden_dim),
-            nn.Tanh(),
+            nn.Linear(4, hidden_dim),
+            nn.Sigmoid(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 4),
-            nn.Sigmoid()
+            nn.Tanh()
         )
-        
-        # 2. 多项式系数：15个可学习参数
-        # g(y0) = a0*y0^2 + a1*y0 + a2
-        # g(y1) = b0*y1^2 + b1*y0*y1 + b2*y1 + b3
-        # g(y2) = c0*y2^2 + c1*y1*y2 + c2*y2 + c3
-        # g(y3) = d0*y3^2 + d1*y2*y3 + d2*y3 + d3
-        self.poly_coeffs = nn.Parameter(torch.zeros(15))  # 初始化15个系数
+                # fA: wa0 + wa1*A + wa2*A^2
+        self.wa0 = torch.nn.Parameter(torch.tensor(0.01))
+        self.wa1 = torch.nn.Parameter(torch.tensor(0.01))  # A linear negative
+        self.wa2 = torch.nn.Parameter(torch.tensor(-0.01))
+
+        # fT: wt0 + wt1*A + wt2*A^2 + wt3*T + wt4*T^2 + wt5*A*T
+        self.wt0  = torch.nn.Parameter(torch.tensor(0.01))
+        self.wt1 = torch.nn.Parameter(torch.tensor(-0.01))  # A term negative
+        self.wt2  = torch.nn.Parameter(torch.tensor(-0.01))  # T term positive
+        self.wt3 = torch.nn.Parameter(torch.tensor(0.01))
+        self.wt4 = torch.nn.Parameter(torch.tensor(0.01))
+        self.wt5 = torch.nn.Parameter(torch.tensor(-0.01))
+
+        # fN: wn0 + wn1*T + wn2*T^2 + wn3*N + wn4*N^2 + wn5*T*N
+        self.wn0  = torch.nn.Parameter(torch.tensor(0.01))
+        self.wn1 = torch.nn.Parameter(torch.tensor(-0.01))  # T term positive
+        self.wn2  = torch.nn.Parameter(torch.tensor(-0.01))  # N term negative
+        self.wn3 = torch.nn.Parameter(torch.tensor(0.01))
+        self.wn4 = torch.nn.Parameter(torch.tensor(0.01))
+        self.wn5 = torch.nn.Parameter(torch.tensor(-0.01))
+
+        # fC: wc0 + wc1*C + wc2*C^2 + wc3*N + wc4*N^2 + wc5*N*C
+        self.wc0  = torch.nn.Parameter(torch.tensor(0.01))
+        self.wc1 = torch.nn.Parameter(torch.tensor(-0.01))  # N term negative
+        self.wc2  = torch.nn.Parameter(torch.tensor(-0.01))  # C term positive
+        self.wc3 = torch.nn.Parameter(torch.tensor(0.01))
+        self.wc4 = torch.nn.Parameter(torch.tensor(0.01))
+        self.wc5 = torch.nn.Parameter(torch.tensor(-0.01))
 
 
     def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        y = y.float()
-        s = s.float()
-        # 确保s是标量，将其扩展为与y兼容的形状
-        if s.dim() == 0:  # s是标量
-            s_expanded = s.unsqueeze(0)  # 变成[1]
-        else:
-            s_expanded = s
-        
-        # 将y和s连接起来作为网络输入
-        z = torch.cat([y, s_expanded], dim=0)  # 连接为[5]的向量
-        
-        # 神经网络部分
-        net_output = self.net(z)
-        
-        # 多项式部分 g(y)
-        y0, y1, y2, y3 = y[0], y[1], y[2], y[3]
-        
-        # 提取多项式系数
-        a0, a1, a2 = self.poly_coeffs[0], self.poly_coeffs[1], self.poly_coeffs[2]
-        b0, b1, b2, b3 = self.poly_coeffs[3], self.poly_coeffs[4], self.poly_coeffs[5], self.poly_coeffs[6]
-        c0, c1, c2, c3 = self.poly_coeffs[7], self.poly_coeffs[8], self.poly_coeffs[9], self.poly_coeffs[10]
-        d0, d1, d2, d3 = self.poly_coeffs[11], self.poly_coeffs[12], self.poly_coeffs[13], self.poly_coeffs[14]
-        
-        # 计算多项式项
-        g0 = a0 * y0**2 + a1 * y0 + a2
-        g1 = b0 * y1**2 + b1 * y0 * y1 + b2 * y1 + b3
-        g2 = c0 * y2**2 + c1 * y1 * y2 + c2 * y2 + c3
-        g3 = d0 * y3**2 + d1 * y2 * y3 + d2 * y3 + d3
-        
-        g_y = torch.stack([g0, g1, g2, g3])
-        
-        # 最终输出：f(y,s) = g(y) + net(y,s)
-        return g_y + net_output
+        A, T, N, C = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
+        fA = self.wa0 + self.wa1 * A + self.wa2 * (A * A)
+        fT = (
+            self.wt0 + self.wt1 * A + self.wt2 * A**2 +
+            self.wt3 * T + self.wt4 * T**2 + self.wt5 * (A * T)
+        )
+        fN = (
+            self.wn0 + self.wn1 * N + self.wn2 * N**2 +
+            self.wn3 * T + self.wn4 * T**2 + self.wn5 * (T * N)
+        )
+        fC = (
+            self.wc0 + self.wc1 * C + self.wc2 * C**2 +
+            self.wc3 * N + self.wc4 * N**2 + self.wc5 * (N * C)
+        )
+        p = torch.stack([fA, fT, fN, fC], dim=-1)
+        return p
 
     def forward(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
         # 4th-order Runge-Kutta integration to solve the ODE
@@ -125,84 +127,70 @@ class ODEModel(nn.Module):
             
         return torch.stack(ys)          # (len_s, 4)
 
-def residual(model, dat, ab_pid_theta, sigma=None):
+def residual(model, s_global, y_global, sigma=None):
     """
-    Calculates the residual: dy/dt - f(y),
+    Calculates the global residual: dy/dt - f(y) for all data points.
     where dy/dt is computed by finite difference (centered for interior, one-sided for endpoints).
-    Returns mean squared error of the residual.
+    Returns mean squared error of the residual across all data points.
     """
-    num_steps = dat['t'].shape[0]
-    if num_steps < 2:
-        device = next(model.parameters()).device
-        return torch.tensor(0.0, device=device)
-
-    alpha = torch.exp(ab_pid_theta[0]) + 1e-4
-    beta  = ab_pid_theta[1]
-    s = alpha * dat['t'] + beta  # (N,)
-    y = dat['y']                 # (N, D)
-
     # Compute dy/dt using finite differences
-    t = dat['t']
-    dy_dt = torch.zeros_like(y)
+    dy_dt = torch.zeros_like(y_global)
+    
     # Forward difference for the first point
-    dy_dt[0] = (y[1] - y[0]) / (t[1] - t[0])
+    dy_dt[0] = (y_global[1] - y_global[0]) / (s_global[1] - s_global[0])
     # Centered difference for interior points
-    if num_steps > 2:
-        dy_dt[1:-1] = (y[2:] - y[:-2]) / (t[2:].unsqueeze(1) - t[:-2].unsqueeze(1))
+    if len(s_global) > 2:
+        dy_dt[1:-1] = (y_global[2:] - y_global[:-2]) / (s_global[2:].unsqueeze(1) - s_global[:-2].unsqueeze(1))
     # Backward difference for the last point
-    dy_dt[-1] = (y[-1] - y[-2]) / (t[-1] - t[-2])
+    dy_dt[-1] = (y_global[-1] - y_global[-2]) / (s_global[-1] - s_global[-2])
 
     # Model prediction f(y) at each s, y
-    # 需要为每个时间点调用f函数
-    fy = torch.zeros_like(y)
-    for i in range(len(s)):
-        fy[i] = model.f(y[i], s[i])
+    fy = torch.zeros_like(y_global)
+    for i in range(len(s_global)):
+        fy[i] = model.f(y_global[i], s_global[i])
 
     residual = dy_dt - fy
     loss = residual ** 2
     if sigma is not None:
         loss = loss * sigma
+
     return loss.mean()
 
 
-def calculate_global_loss(model, dat, ab_pid_theta, sigma=None):
+def calculate_global_loss(model, s_global, y_global, sigma=None):
     """
-    Calculates the loss based on the global trajectory from y0.
+    Calculates the global loss based on prediction from s=-10, y0=[0.1,0,0,0].
+    All s values are concatenated and sorted as s_global, then predict for all data points.
     """
-    num_steps = dat['t'].shape[0]
-    if num_steps < 2:
-        device = next(model.parameters()).device
-        return torch.tensor(0.0, device=device)
-
-    alpha = torch.exp(ab_pid_theta[0]) + 1e-4
-    beta  = ab_pid_theta[1]
-    s = alpha * dat['t'] + beta
+    # 从s=-10, y0=[0.1,0,0,0]开始预测
+    s_start = torch.tensor(-10.0)
+    y0_global = torch.tensor([0.1, 0, 0, 0])
     
-    y0 = dat['y'][0]
+    # 预测整个轨迹
+    y_pred_global = model(s_global, y0_global)
     
-    y_pred_trajectory = model(s, y0)
-    y_actual_trajectory = dat['y']
-    
-    loss = (y_pred_trajectory - y_actual_trajectory)**2
+    # 计算MSE
+    loss = (y_pred_global - y_global)**2
     if sigma is not None:
         loss = loss * sigma
-        
+
     return loss.mean()
 
-def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None, r=0.5):
+def calculate_combined_loss(model, s_global, y_global, sigma=None, r=0.5, s_penalty_weight=0.1):
     """
     Calculates a combined loss: r% residual and (1-r)% global.
+    Adds exponential penalty for s values outside [-10, 20] range.
     """
-    res = residual(model, dat, ab_pid_theta, sigma)
-    loss_global = calculate_global_loss(model, dat, ab_pid_theta, sigma)
+    #res = residual(model, s_global, y_global, sigma)
+    loss_global = calculate_global_loss(model, s_global, y_global, sigma)
     '''
     zero = torch.zeros(4)
     one = torch.ones(4)
     s_default = torch.tensor(0.0)
     combined_loss = ( loss_global + res ) * torch.exp(torch.norm(model.f(B, s_default)) + torch.norm(model.f(D, s_default))) / (torch.norm(model.f(C, s_default)) + 1e-5)
     '''
-    combined_loss = r * res + (1-r) * loss_global
-    return combined_loss
+    #combined_loss = r * res + (1-r) * loss_global
+    return loss_global
 
 
 import torch, torch.nn as nn, torch.optim as optim
@@ -221,31 +209,21 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
-        n_adam      = 120,      # adam 阶段迭代次数
-        n_lbfgs    = 0,     # lbfgs 阶段迭代次数
-        adam_lr_w    = 5e-3,
-        adam_lr_ab   = 1e-4,
-        lbfgs_lr_w   = 1e-2,
-        lbfgs_lr_ab  = 1e-2,
+        n_adam      = 500,      # adam 阶段迭代次数
         batch_size=128,
+        opt_w_lr=1e-2,
         weighted_sampling=True,
-        delta = 30,
-        max_lbfgs_it = 10,
-        tolerance_grad = 0,
-        tolerance_change = 0,
-        reg_lambda_alpha=1e-2,
-        reg_lambda_smooth=0.,
         early_stop_patience=80,
         early_stop_threshold=0.001):
     sigma = torch.ones(4)
 
     # ---------- 初始化 ----------
-    model = ODEModel(hidden_dim=32, num_layers=2)
+    model = ODEModel(hidden_dim=64, num_layers=3)
     def weights_init(m):
         if isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            nn.init.normal_(m.weight, mean=0, std=1)  # 将权重初始化为很小的随机值
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.bias, 0)  # 将偏置初始化为0
     model.apply(weights_init)
     
     # Accelerate model with JIT compilation
@@ -274,45 +252,64 @@ def fit_population(
         batch_iterator = iter(dataloader)
 
     stage_dict = pc.load_stage_dict()
-    ab = {}
-    for pid, dat in patient_data.items():
-        stage = stage_dict.get(pid, 'Other')
-        t = dat['t']
-
-        if stage == 'CN':
-            s_range = (-10.0, 0.0)
-        elif stage == 'LMCI':
-            s_range = (0.0, 10.0)
-        elif stage == 'AD':
-            s_range = (10.0, 20.0)
-        else:  # Default for 'Other' or missing stages
-            s_range = (-5.0, 5.0)
+    
+    # 加载预训练的DPS参数
+    try:
+        ab = torch.load('dps_ab_pretrained.pth')
+        print("Successfully loaded pretrained DPS parameters from dps_ab_pretrained.pth")
         
-        alpha_init = torch.empty(1).uniform_(1, torch.exp(torch.tensor(4.0)))
-        alpha_init = torch.min( alpha_init, 10/(t.max()-t.min()))
-        # Convert to theta space where alpha = exp(theta0)+eps and beta = theta1
-        theta0 = torch.log(alpha_init - 1e-4)
-        beta_init = torch.empty(1).uniform_(s_range[0]-theta0.item()*t.min().item(), s_range[1]-theta0.item()*t.max().item())
-        theta1 = beta_init
+        # 将theta参数设置为不需要梯度，因为我们不再训练a,b
+        for pid in ab:
+            if 'theta' in ab[pid]:
+                ab[pid]['theta'] = ab[pid]['theta'].detach().requires_grad_(False)
+            else:
+                # 如果加载的是直接的alpha, beta值，转换为theta格式
+                alpha, beta = ab[pid]
+                ab[pid] = {'theta': alpha, 'beta': beta}
+                
+    except FileNotFoundError:
+        print("Warning: dps_ab_pretrained.pth not found. Computing a,b from age to stage mapping.")
+        ab = {}
+        for pid, dat in patient_data.items():
+            stage = stage_dict.get(pid, 'Other')
+            t = dat['t']  # 年龄时间序列
 
-        ab[pid] = {'theta': torch.tensor([theta0.item(), theta1.item()], requires_grad=True)}
+            # 根据stage确定s的范围
+            if stage == 'CN':
+                s_range = (-10.0, 0.0)
+            elif stage == 'LMCI':
+                s_range = (0.0, 10.0)
+            elif stage == 'AD':
+                s_range = (10.0, 20.0)
+            else:  # Default for 'Other' or missing stages
+                s_range = (-5.0, 5.0)
+            
+            # 线性变换：将年龄范围 [t_min, t_max] 映射到s范围 [s_min, s_max]
+            # s = a * t + b
+            # 求解：s_min = a * t_min + b, s_max = a * t_max + b
+            t_min, t_max = t.min().item(), t.max().item()
+            s_min, s_max = s_range[0], s_range[1]
+            
+            # 如果t_min == t_max，设置默认值
+            if abs(t_max - t_min) < 1e-6:
+                a = 1.0
+                b = s_min - a * t_min
+            else:
+                # 计算线性变换参数
+                a = (s_max - s_min) / (t_max - t_min)
+                b = s_min - a * t_min
+            
+            # 确保a > 0，并转换为theta格式
+            a = max(a, 1e-4)  # 确保a > 0
+            theta0 = torch.log(torch.tensor(a - 1e-4))
+            theta1 = torch.tensor(b)
+            
+            ab[pid] = {'theta': torch.tensor([theta0.item(), theta1.item()], requires_grad=False)}
 
     # --------- Adam 优化器池 -----------
-    opt_w_adam  = optim.Adam(model.parameters(), lr=adam_lr_w, weight_decay=1e-4)
-    opt_ab_adam = {pid: optim.Adam([ab[pid]['theta']], lr=adam_lr_ab)
-                   for pid in ab}
-    scheduler = optim.lr_scheduler.MultiStepLR(opt_w_adam, milestones=list(range(60, 151)), gamma=0.99, last_epoch=-1)
-    opt_w_lbfgs = optim.LBFGS(model.parameters(), 
-                                lr=lbfgs_lr_w,
-                                max_iter=max_lbfgs_it, 
-                                tolerance_grad=tolerance_grad, 
-                                tolerance_change=tolerance_change)
-    opt_ab_lbfgs = {pid: optim.LBFGS([ab[pid]['theta']],
-                                   lr=lbfgs_lr_ab,
-                                   max_iter=max_lbfgs_it,
-                                   tolerance_grad=tolerance_grad,
-                                   tolerance_change=tolerance_change)
-                    for pid in ab}
+    opt_w  = optim.Adam(model.parameters(), lr=opt_w_lr, weight_decay=1e-4)
+    # 不再需要a,b的优化器，因为我们不再训练这些参数
+    scheduler = optim.lr_scheduler.MultiStepLR(opt_w, milestones=list(range(60, 151)), gamma=0.99, last_epoch=-1)
 
     # --------- 训练循环 -----------
     training_stopped = False
@@ -320,13 +317,8 @@ def fit_population(
     early_stop_counter = 0
     last_adam_loss = float('inf')
     adam_loss_history = []
-    
-    # 模型备份相关变量
-    model_backup = None
-    ab_backup = None
-    backup_iter = 0
 
-    # 交替更新：Adam更新w 10轮，然后L-BFGS更新a,b一轮
+    # 只更新模型参数w，a,b使用预训练参数
     for it in range(n_adam):
         # ======================== 更新 w (Adam) =========================
         if use_minibatch:
@@ -338,7 +330,7 @@ def fit_population(
         else:
             batch_pids = patient_pids
 
-        opt_w_adam.zero_grad()
+        opt_w.zero_grad()
         loss_w = 0.
         
         # Convert tensor PIDs to integer for dict lookup
@@ -348,12 +340,41 @@ def fit_population(
         if not valid_pids_in_batch:
             continue
 
+        # 收集所有患者的s值和y值
+        all_s_values = []
+        all_y_values = []
+        
         for pid in valid_pids_in_batch:
             dat = patient_data[pid]
-            loss_w += calculate_combined_loss(model, dat, ab[pid]['theta'], sigma=sigma)
+            a = ab[pid]['theta'][0]
+            b = ab[pid]['theta'][1]
+            s_values = a * dat['t'] + b
+            y_values = dat['y']
+            
+            all_s_values.append(s_values)
+            all_y_values.append(y_values)
         
-        if len(valid_pids_in_batch) > 0:
-            loss_w /= len(valid_pids_in_batch)
+        # 拼接所有s值和y值
+        s_global = torch.cat(all_s_values)
+        y_global = torch.cat(all_y_values)
+        
+        # 对s_global排序，并相应重排y_global
+        s_global_sorted, sort_indices = torch.sort(s_global)
+        y_global_sorted = y_global[sort_indices]
+
+        # 过滤掉s_global_sorted的5%和95%分位数以外的数据
+        s_5_percentile = torch.quantile(s_global_sorted, 0.05)
+        s_95_percentile = torch.quantile(s_global_sorted, 0.95)
+        
+        # 创建过滤掩码
+        mask = (s_global_sorted >= s_5_percentile) & (s_global_sorted <= s_95_percentile)
+        
+        # 应用过滤
+        s_global_filtered = s_global_sorted[mask]
+        y_global_filtered = y_global_sorted[mask]
+        
+        # 计算全局损失（使用过滤后的数据）
+        loss_w = calculate_combined_loss(model, s_global_filtered, y_global_filtered, sigma=sigma)
 
         # --- Early stopping and logging with moving average ---
         adam_loss_history.append(loss_w.item())
@@ -380,85 +401,26 @@ def fit_population(
             training_stopped = True
         else:
             loss_w.backward()
-            opt_w_adam.step()
+            opt_w.step()
             scheduler.step()
-
-        # ====================== 每delta轮更新一次 α,β (L-BFGS) ==========================
-        if (it + 1) % delta == 0:
-            print(f"Iter {it+1:02d}: Updating α,β with L-BFGS...")
-            
-            # 保存模型和ab的备份
-            model_backup = copy.deepcopy(model.state_dict())
-            ab_backup = {pid: ab[pid]['theta'].clone() for pid in ab}
-            backup_iter = it + 1
-            print(f"Iter {it+1:02d}: Model backup saved.")
-            
-            # 使用所有患者数据更新a,b
-            nan_detected = False
-            for pid in patient_data.keys():
-                dat = patient_data[pid]
-                if dat['t'].shape[0] < 2:
-                    continue
-
-                def closure_ab():
-                    opt_ab_lbfgs[pid].zero_grad()
-                    loss = calculate_combined_loss(model, dat, ab[pid]['theta'], sigma)
-                    if not torch.isnan(loss):
-                        loss.backward()
-                    return loss
-                
-                try:
-                    loss_ab = opt_ab_lbfgs[pid].step(closure_ab)
-                    if torch.isnan(loss_ab):
-                        print(f"Iter {it+1:02d}: L-BFGS loss for α,β for pid {pid} is NaN.")
-                        nan_detected = True
-                        break
-                except Exception as e:
-                    print(f"Iter {it+1:02d}: L-BFGS failed for pid {pid}: {e}")
-                    nan_detected = True
-                    break
-            
-            # 如果检测到NaN，恢复备份
-            if nan_detected:
-                print(f"Iter {it+1:02d}: NaN detected, restoring model from backup (iter {backup_iter}).")
-                model.load_state_dict(model_backup)
-                for pid in ab:
-                    ab[pid]['theta'] = ab_backup[pid].clone()
-                print(f"Iter {it+1:02d}: Model restored successfully.")
-            else:
-                print(f"Iter {it+1:02d}: L-BFGS update completed successfully.")
 
         if training_stopped:
             break
 
         # ---------- 可选：估计 σk ----------
         with torch.no_grad():
-            all_residuals = []
-            for pid, dat in patient_data.items():
-                num_steps = dat['t'].shape[0]
-                if num_steps < 2:
-                    continue
-                
-                a = torch.exp(ab[pid]['theta'][0]) + 1e-4
-                b = ab[pid]['theta'][1]
-                s = a * dat['t'] + b
-                
-                for i in range(num_steps - 1):
-                    s_grid_step = s[i:i+2]
-                    y0_step = dat['y'][i]
-                    y_pred_step = model(s_grid_step, y0_step)
-                    residual = y_pred_step[1] - dat['y'][i+1]
-                    all_residuals.append(residual)
-
-            if all_residuals:
-                all_residuals = torch.stack(all_residuals)
-                # Variance of residuals for each biomarker
-                sigma = all_residuals.var(dim=0)
+            y0 = torch.tensor([0.1, 0, 0, 0])
+            
+            # 预测整个轨迹
+            y_pred = model(s_global_filtered, y0)
+            sigma = (y_pred - y_global_filtered)**2
+            if torch.any(sigma):
+                sigma = sigma.mean(dim=0)
             else:
                 sigma = torch.ones(4) # Fallback if no residuals calculated
 
         # ----------- 监控 ----------
-        if (it+1) % 1 == 0:
+        if (it+1) % 50 == 0:
             print(f"iter {it+1:02d}/{n_adam} | "
                   f"Adam | "
                   f"Batch MSE={loss_w.item():.4f} | "
@@ -467,17 +429,10 @@ def fit_population(
     # --------- 输出 ----------
     model.eval() # Switch to evaluation mode before returning
     
-    # 检查是否使用了备份模型
-    if model_backup is not None:
-        print(f"Training completed. Last backup was saved at iteration {backup_iter}.")
-    
-    alpha_beta = {pid: (float(torch.exp(v['theta'][0])+1e-4),
-                        float(v['theta'][1]))
-                  for pid, v in ab.items()}
-    return model, alpha_beta
+    return model
 
-model, ab_dict = fit_population(
-    patient_data,)
+model = fit_population(
+    patient_data)
 
 try:
     torch.save(model.state_dict(), f'{name}.pth')
@@ -485,110 +440,111 @@ except Exception as e:
     print(f"Error saving model: {e} 喵！   _(┐ ◟;ﾟдﾟ)ノ")
 
 # ---------- 2. 绘制人群四联图 (根据s的10%和90%分位数) -----------------
-# 收集所有患者的s值
-all_s_values = []
-for p in patient_data:
-    s_values = ab_dict[p][0] * patient_data[p]['t'] + ab_dict[p][1]
-    all_s_values.append(s_values)
-
-# 计算所有s值的10分位数和90分位数
-all_s_flat = torch.cat(all_s_values)
-s_10_percentile = torch.quantile(all_s_flat, 0.10)
-s_90_percentile = torch.quantile(all_s_flat, 0.90)
-
-print(f"S value range: 10th percentile = {s_10_percentile:.2f}, 90th percentile = {s_90_percentile:.2f}")
-
-# 使用10分位数到90分位数的范围
-s_min = s_10_percentile
-s_max = s_90_percentile
-s_curve = torch.linspace(s_min, s_max, 100)
-
-# 过滤在10-90分位数范围内的数据点
-keep = []
-for p in patient_data:
-    s_values = ab_dict[p][0] * patient_data[p]['t'] + ab_dict[p][1]
-    # 检查是否有任何s值在范围内
-    if torch.any((s_values >= s_min) & (s_values <= s_max)):
-        keep.append(p)
-
-stage_dict = pc.load_stage_dict()
-
-# 准备绘图数据 - 使用10分位数对应的y值作为起始点
-y0_pop = torch.tensor([0.1,0,0,0])
-
-# ---------- 添加新轨迹：从10分位数开始的完整轨迹 ----------
 with torch.no_grad():
+    # 收集所有患者的s值
+    ab = torch.load('dps_ab_pretrained.pth')
+    all_s_values = []
+    for p in patient_data:
+        s_values = ab[p]['theta'][0] * patient_data[p]['t'] + ab[p]['theta'][1]
+        all_s_values.append(s_values)
+
+    # 计算所有s值的10分位数和90分位数
+    all_s_flat = torch.cat(all_s_values)
+    s_10_percentile = torch.quantile(all_s_flat, 0.10)
+    s_90_percentile = torch.quantile(all_s_flat, 0.90)
+
+    print(f"S value range: 10th percentile = {s_10_percentile:.2f}, 90th percentile = {s_90_percentile:.2f}")
+
+    # 使用10分位数到90分位数的范围
+    s_min = s_10_percentile
+    s_max = s_90_percentile
+    s_curve = torch.linspace(s_min, s_max, 100)
+
+    # 过滤在10-90分位数范围内的数据点
+    keep = []
+    for p in patient_data:
+        s_values = ab[p]['theta'][0] * patient_data[p]['t'] + ab[p]['theta'][1]
+        # 检查是否有任何s值在范围内
+        if torch.any((s_values >= s_min) & (s_values <= s_max)):
+            keep.append(p)
+
+    stage_dict = pc.load_stage_dict()
+
+    # 准备绘图数据 - 使用10分位数对应的y值作为起始点
+    y0_pop = torch.tensor([0.1,0,0,0])
+
+    # ---------- 添加新轨迹：从10分位数开始的完整轨迹 ----------
     y_curve_full = model(s_curve, y0_pop)
     y_curve_full = y_curve_full.detach().numpy()
-y_curve_full = pc.inv_nor(y_curve_full)
+    y_curve_full = pc.inv_nor(y_curve_full)
 
-TITLES = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
+    TITLES = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
 
-fig2, axes = plt.subplots(2, 2, figsize=(9, 6))
-for k, ax in enumerate(axes.flat):
-    # --- 分阶段准备散点数据 ---
-    s_by_stage = {'CN': [], 'LMCI': [], 'AD': [], 'Other': []}
-    y_by_stage = {'CN': [], 'LMCI': [], 'AD': [], 'Other': []}
+    fig2, axes = plt.subplots(2, 2, figsize=(9, 6))
+    for k, ax in enumerate(axes.flat):
+        # --- 分阶段准备散点数据 ---
+        s_by_stage = {'CN': [], 'LMCI': [], 'AD': [], 'Other': []}
+        y_by_stage = {'CN': [], 'LMCI': [], 'AD': [], 'Other': []}
 
-    for p in keep:
-        a, b = ab_dict[p]
-        stage = stage_dict.get(p, 'Other')
-        if stage not in s_by_stage:
-            stage = 'Other'
+        for p in keep:
+            a, b = ab[p]['theta'][0], ab[p]['theta'][1]
+            stage = stage_dict.get(p, 'Other')
+            if stage not in s_by_stage:
+                stage = 'Other'
+            
+            s_values = a * patient_data[p]['t'] + b
+            y_values = patient_data[p]['y'][:, k]
+            
+            # 只保留在10-90分位数范围内的数据点
+            mask = (s_values >= s_min) & (s_values <= s_max)
+            if torch.any(mask):
+                s_by_stage[stage].append(s_values[mask])
+                y_by_stage[stage].append(y_values[mask])
+
+        # --- 绘制散点 (分期颜色) ---
+        colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
+        for stage, s_points_list in s_by_stage.items():
+            if s_points_list:
+                s_all = torch.cat(s_points_list).numpy()
+                y_all = torch.cat(y_by_stage[stage]).numpy()
+                y_all = pc.inv_nor(y_all, k)
+                ax.scatter(s_all, y_all, s=15, alpha=0.6, c=colors[stage], label=stage)
         
-        s_values = a * patient_data[p]['t'] + b
-        y_values = patient_data[p]['y'][:, k]
+        # --- 从平均初值开始的完整轨迹 ---
+        y_curve = y_curve_full[:,k]
+        ax.plot(s_curve, y_curve, lw=1.5, c='red', linestyle='--', label='Trajectory from Mean Initial')
         
-        # 只保留在10-90分位数范围内的数据点
-        mask = (s_values >= s_min) & (s_values <= s_max)
-        if torch.any(mask):
-            s_by_stage[stage].append(s_values[mask])
-            y_by_stage[stage].append(y_values[mask])
+        ax.set_xlabel('Disease progression score  s')
+        ax.set_ylabel(TITLES[k])
+        ax.legend(fontsize=8)
 
-    # --- 绘制散点 (分期颜色) ---
-    colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
-    for stage, s_points_list in s_by_stage.items():
-        if s_points_list:
-            s_all = torch.cat(s_points_list).numpy()
-            y_all = torch.cat(y_by_stage[stage]).numpy()
-            y_all = pc.inv_nor(y_all, k)
-            ax.scatter(s_all, y_all, s=15, alpha=0.6, c=colors[stage], label=stage)
-    
-    # --- 从平均初值开始的完整轨迹 ---
-    y_curve = y_curve_full[:,k]
-    ax.plot(s_curve, y_curve, lw=1.5, c='red', linestyle='--', label='Trajectory from Mean Initial')
-    
-    ax.set_xlabel('Disease progression score  s')
-    ax.set_ylabel(TITLES[k])
-    ax.legend(fontsize=8)
+    fig2.suptitle(f'Population Model (s in 10-90 percentile: [{float(s_min):.2f}, {float(s_max):.2f}])')
+    plt.tight_layout(rect=[0,0,1,0.96])
+    plt.savefig(f'{name}.png')
 
-fig2.suptitle(f'Population Model (s in 10-90 percentile: [{float(s_min):.2f}, {float(s_max):.2f}])')
-plt.tight_layout(rect=[0,0,1,0.96])
-plt.savefig(f'{name}.png')
+    plt.show()
 
-plt.show()
+    def eval_global_loss(y_pred, y_true):
+        y_pred_t = torch.as_tensor(y_pred)
+        return torch.mean((y_pred_t - y_true) ** 2)
+    loss = 0
+    with torch.no_grad():
+        for pid in patient_data:
+            a, b = ab[pid]['theta'][0], ab[pid]['theta'][1]
+            s = a * patient_data[pid]['t'] + b
+            y_pred = model(s, patient_data[pid]['y0'])
+            y_pred = y_pred.numpy()
+            loss += eval_global_loss(y_pred, patient_data[pid]['y'])/len(y_pred)
+        loss /= len(patient_data)
 
-def eval_global_loss(y_pred, y_true):
-    y_pred_t = torch.as_tensor(y_pred)
-    return torch.mean((y_pred_t - y_true) ** 2)
-loss = 0
-with torch.no_grad():
-    for pid in patient_data:
-        a, b = ab_dict[pid]
-        s = a * patient_data[pid]['t'] + b
-        y_pred = model(s, patient_data[pid]['y0'])
-        y_pred = y_pred.numpy()
-        loss += eval_global_loss(y_pred, patient_data[pid]['y'])/len(y_pred)
-    loss /= len(patient_data)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-# 追加到输出文件
-output_filename = f'experiments.out'
-with open(output_filename, 'a') as f:  # 使用追加模式 'a'
-    f.write(name)
-    f.write(f"Time: {current_time}\n")
-    f.write(Message)
-    f.write("Model structure:\n")
-    f.write(str(model))
-    f.write(f"MSE: {loss:.4f}")
+    # 追加到输出文件
+    output_filename = f'experiments.out'
+    with open(output_filename, 'a') as f:  # 使用追加模式 'a'
+        f.write(name)
+        f.write(f"Time: {current_time}\n")
+        f.write(Message)
+        f.write("Model structure:\n")
+        f.write(str(model))
+        f.write(f"MSE: {loss:.4f}")
