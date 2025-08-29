@@ -1,588 +1,159 @@
-fnnTime: 2025-08-21 23:52:14
-Evaluation with loaded fnn.pthModel structure:
+fmpTime: 2025-08-26 19:10:59
+This is a simple FNN model multiples polynomial model with fixed pretrained DPS parameters.Model structure:
 ODEModel(
   (net): Sequential(
-    (0): Linear(in_features=5, out_features=32, bias=True)
-    (1): Sigmoid()
-    (2): Linear(in_features=32, out_features=4, bias=True)
-    (3): Sigmoid()
-  )
-)MSE: 0.0491fnnTime: 2025-08-23 16:06:38
-Evaluation with loaded fnn.pthModel structure:
-ODEModel(
-  (net): Sequential(
-    (0): Linear(in_features=5, out_features=32, bias=True)
-    (1): Tanh()
-    (2): Linear(in_features=32, out_features=32, bias=True)
-    (3): Tanh()
-    (4): Linear(in_features=32, out_features=4, bias=True)
-  )
-)MSE: 0.1850fnnTime: 2025-08-23 16:31:55
-This is a simple FNN model with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0320fnnTime: 2025-08-23 16:44:18
-This is a simple FNN model with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0345fnnTime: 2025-08-23 17:53:47
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: nanfnnTime: 2025-08-23 18:12:39
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: nanfnnTime: 2025-08-23 18:25:18
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0356fnnTime: 2025-08-23 18:33:25
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0591fnnTime: 2025-08-23 19:08:32
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 4.5871fnnTime: 2025-08-23 19:09:10
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0444fnnTime: 2025-08-23 19:10:49
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0444fnnTime: 2025-08-23 19:14:02
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0447fnnTime: 2025-08-23 19:17:08
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0434fnnTime: 2025-08-23 19:20:53
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0449fnnTime: 2025-08-23 19:21:13
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: nanfnnTime: 2025-08-23 19:28:15
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0439fnnTime: 2025-08-23 19:33:39
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0443fnnTime: 2025-08-23 19:37:58
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Tanh)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 5.7986fnnTime: 2025-08-23 19:49:40
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: nanfnnTime: 2025-08-23 19:50:43
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 2.3844fnnTime: 2025-08-23 19:51:14
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Sigmoid)
-  )
-)MSE: 0.0442fnnTime: 2025-08-23 19:53:18
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0440fnnTime: 2025-08-23 19:57:52
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0446
-fnn_comparison
-Time: 2025-08-23 20:01:15
-Evaluation with loaded fnn.pth - Hybrid Model with Polynomial and Neural Network
-Model structure:
-ODEModel(
-  (net): Sequential(
-    (0): Linear(in_features=5, out_features=32, bias=True)
+    (0): Linear(in_features=4, out_features=64, bias=True)
     (1): ReLU()
-    (2): Linear(in_features=32, out_features=4, bias=True)
-    (3): Tanh()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)
-MSE: 0.0444
-Polynomial coefficients: [-0.00224469 -0.00098736  0.00068397  0.          0.          0.
-  0.          0.          0.          0.          0.          0.
-  0.          0.          0.        ]
-fnnTime: 2025-08-23 21:57:08
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0443
-fnn_comparison
-Time: 2025-08-23 21:57:31
-Evaluation with loaded fnn.pth - Hybrid Model with Polynomial and Neural Network
-Model structure:
+)MSE: inffnnTime: 2025-08-27 13:12:41
+This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
 ODEModel(
   (net): Sequential(
-    (0): Linear(in_features=5, out_features=32, bias=True)
+    (0): Linear(in_features=4, out_features=64, bias=True)
     (1): ReLU()
-    (2): Linear(in_features=32, out_features=4, bias=True)
-    (3): Tanh()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)
-MSE: 0.0444
-Polynomial coefficients: [ 4.4902999e-04  6.7010573e-05  1.4218380e-03  2.3263020e-17
-  5.2027395e-16 -1.1599612e-14  1.1306652e-15 -8.1945885e-17
- -1.3814161e-17 -2.4633269e-11 -7.1504895e-15  5.1449336e-15
- -1.7243420e-15 -8.2053826e-15 -3.5218044e-15]
-fnnTime: 2025-08-23 22:03:13
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0439fnnTime: 2025-08-23 22:08:56
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: nanfnnTime: 2025-08-23 22:10:56
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 463.2096fnnTime: 2025-08-23 22:17:24
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0441fnnTime: 2025-08-23 22:21:43
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: nanfnnTime: 2025-08-23 22:23:23
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: nanfnnTime: 2025-08-23 22:40:56
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0444fnnTime: 2025-08-23 22:46:41
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0444fnnTime: 2025-08-23 23:22:02
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0443fnnTime: 2025-08-23 23:54:18
-This is a hybrid model with polynomial terms and FNN with activation TanhModel structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=ReLU)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=Tanh)
-  )
-)MSE: 0.0445fnnTime: 2025-08-26 14:07:00
+)MSE: 0.1235fnnTime: 2025-08-27 13:17:40
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: 15.2654fnnTime: 2025-08-26 14:07:48
+)MSE: 0.0447fnnTime: 2025-08-27 13:28:31
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: 0.0433fnnTime: 2025-08-26 16:13:50
+)MSE: 0.0453sfTime: 2025-08-27 15:34:50
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: 0.0442fnnTime: 2025-08-26 16:35:11
+)MSE: 0.0454sfTime: 2025-08-27 15:46:21
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: 0.0420fnnTime: 2025-08-26 16:40:03
+)MSE: 7.5681sfTime: 2025-08-27 15:50:18
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: nanfnnTime: 2025-08-26 16:41:51
+)MSE: 0.0935sfTime: 2025-08-27 16:01:21
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: 2778.8291fnnTime: 2025-08-26 16:49:40
+)MSE: 0.0440sfTime: 2025-08-27 16:04:36
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: nanfnnTime: 2025-08-26 16:55:48
+)MSE: 0.0432sfTime: 2025-08-27 16:07:44
 This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: nanfnnTime: 2025-08-26 16:56:50
-This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+)MSE: 0.0430fmpTime: 2025-08-27 16:22:26
+This is a simple FNN model multiples polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: inffnnTime: 2025-08-26 16:57:17
-This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+)MSE: 0.0431fmpTime: 2025-08-27 16:31:58
+This is a simple FNN model multiples polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: 6.8182fnnTime: 2025-08-26 17:04:42
-This is a simple FNN model with fixed pretrained DPS parameters.Model structure:
-RecursiveScriptModule(
-  original_name=ODEModel
-  (net): RecursiveScriptModule(
-    original_name=Sequential
-    (0): RecursiveScriptModule(original_name=Linear)
-    (1): RecursiveScriptModule(original_name=Sigmoid)
-    (2): RecursiveScriptModule(original_name=Linear)
-    (3): RecursiveScriptModule(original_name=ReLU)
-    (4): RecursiveScriptModule(original_name=Linear)
-    (5): RecursiveScriptModule(original_name=Tanh)
+)MSE: 0.0429fppTime: 2025-08-27 16:55:49
+This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
   )
-)MSE: nan
+)MSE: 0.0426spTime: 2025-08-27 18:05:21
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0421spTime: 2025-08-27 18:20:26
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0421sfTime: 2025-08-27 18:23:56
+FNN-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=64, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=64, out_features=64, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=64, out_features=4, bias=True)
+    (5): Tanh()
+  )
+)MSE: 0.0431

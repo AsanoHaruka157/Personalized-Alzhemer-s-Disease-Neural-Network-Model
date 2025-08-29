@@ -163,8 +163,8 @@ def plot_dps_scatter(patient_data: dict, stage_dict: dict, ab: dict, save_path: 
     y_all_orig = pc.inv_nor(y_all)
 
     # 仅对 s 按 10% 与 90% 分位做过滤
-    s10 = np.quantile(s_all, 0.10)
-    s90 = np.quantile(s_all, 0.90)
+    s10 = np.quantile(s_all, 0.5)
+    s90 = np.quantile(s_all, 0.95)
     mask_s = (s_all >= s10) & (s_all <= s90)
     s_all = s_all[mask_s]
     y_all_orig = y_all_orig[mask_s]
