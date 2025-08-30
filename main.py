@@ -14,12 +14,8 @@ name = 'original'
 discription = 'This is original code simulating algorithm 1 in the paper'
 
 # ------------------ 加载数据 ------------------
-<<<<<<< HEAD
 csf_dict = pc.load_csf_data()
 print("Number of valid patients:", len(csf_dict))
-=======
-csf_dict = pc.load_data()
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
 
 patient_data = {}
 for pid, sample in csf_dict.items():
@@ -31,7 +27,6 @@ print("Valid patients: ", len(patient_data))
 
 import torch.nn as nn
 
-<<<<<<< HEAD
 class Gaussian(nn.Module):
     """
     Gaussian activation function.
@@ -61,8 +56,6 @@ D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
 Message = f"This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters."
 name = 'fpp'
 
-=======
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
 class ODEModel(nn.Module):
     def __init__(self, hidden_dim=32, num_layers=2):
         super().__init__()
@@ -72,7 +65,6 @@ class ODEModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 4),
-<<<<<<< HEAD
             nn.Tanh()
         )
                 # fA: wa0 + wa1*A + wa2*A^2
@@ -125,12 +117,6 @@ class ODEModel(nn.Module):
 
     def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         return self.net(y)+self.poly(y, s)
-=======
-        )
-
-    def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        return self.net(y)
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
 
     def _rk4_integrate(self, s_grid: torch.Tensor, y0: torch.Tensor, f_fn) -> torch.Tensor:
         ys = [y0]
@@ -146,7 +132,6 @@ class ODEModel(nn.Module):
             y_next = y_i + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
             ys.append(y_next)
 
-<<<<<<< HEAD
         return torch.stack(ys)
 
     def forward(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
@@ -164,11 +149,6 @@ class ODEModel(nn.Module):
 def residual(model, s_global, y_global, sigma=None):
     """
     Calculates the global residual: dy/dt - f(y) for all data points.
-=======
-def residual(model, dat, ab_pid_theta, sigma=None):
-    """
-    Calculates the residual: dy/dt - f(y),
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
     where dy/dt is computed by finite difference (centered for interior, one-sided for endpoints).
     Returns mean squared error of the residual across all data points.
     """
@@ -184,15 +164,9 @@ def residual(model, dat, ab_pid_theta, sigma=None):
     dy_dt[-1] = (y_global[-1] - y_global[-2]) / (s_global[-1] - s_global[-2])
 
     # Model prediction f(y) at each s, y
-<<<<<<< HEAD
     fy = torch.zeros_like(y_global)
     for i in range(len(s_global)):
         fy[i] = model.f(y_global[i], s_global[i])
-=======
-    fy = torch.zeros_like(y)
-    for i in range(len(s)):
-        fy[i] = model.f(y[i], s[i])
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
 
     residual = dy_dt - fy
     loss = residual ** 2
@@ -202,27 +176,14 @@ def residual(model, dat, ab_pid_theta, sigma=None):
     return loss.mean()
 
 
-<<<<<<< HEAD
 def calculate_global_loss(model, s_global, y_global, sigma=None):
-=======
-def traj_loss(model, dat, alpha, beta, sigma=None):
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
     """
     Calculates the global loss based on prediction from s=-10, y0=[0.1,0,0,0].
     All s values are concatenated and sorted as s_global, then predict for all data points.
     """
-<<<<<<< HEAD
     # 从s=-10, y0=[0.1,0,0,0]开始预测
     s_start = torch.tensor(-10.0)
     y0_global = torch.tensor([0.1, 0, 0, 0])
-=======
-    num_steps = dat['t'].shape[0]
-    if num_steps < 2:
-        device = next(model.parameters()).device
-        return torch.tensor(0.0, device=device)
-
-    s = alpha * dat['t'] + beta
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
     
     # 预测整个轨迹
     y_pred_global = model(s_global, y0_global)
@@ -230,7 +191,6 @@ def traj_loss(model, dat, alpha, beta, sigma=None):
     # 计算MSE
     loss = (y_pred_global - y_global)**2
     if sigma is not None:
-<<<<<<< HEAD
         loss = loss * sigma
 
     return loss.mean()
@@ -250,20 +210,6 @@ def calculate_combined_loss(model, s_global, y_global, sigma=None, r=0.5, s_pena
     '''
     #combined_loss = r * res + (1-r) * loss_global
     return loss_global
-=======
-        loss = loss / sigma
-    return loss.sum()
-
-def calculate_combined_loss(model, dat, ab_pid_theta, sigma=None, lambda_=0.5):
-    """
-    Calculates a combined loss: lambda % sequential and (1-lambda)% global.
-    """
-    res = residual(model, dat, ab_pid_theta, sigma)
-    loss_global = calculate_global_loss(model, dat, ab_pid_theta, sigma)
-    combined_loss = (1-lambda_) * loss_global + lambda_ * res
-        
-    return combined_loss
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
 
 
 import torch, torch.nn as nn, torch.optim as optim
@@ -282,7 +228,6 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
-<<<<<<< HEAD
         n_adam      = 300,      # adam 阶段迭代次数
         batch_size=128,
         opt_w_lr=1e-3,
@@ -293,22 +238,6 @@ def fit_population(
 
     # ---------- 初始化 ----------
     model = ODEModel(hidden_dim=64, num_layers=3)
-=======
-        n_epochs      = 100,
-        param_update_steps = 10,
-        adam_lr_w    = 1e-2,
-        adam_lr_ab   = 1e-3,
-        ):
-    
-    # ---------- 计算每个生物标记物的全局方差以调整权重 ----------
-    all_biomarkers = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
-    sigma = all_biomarkers.var(dim=0)
-    # 加上一个很小的数防止除以零
-    sigma = sigma.clamp_min(1e-8)
-
-    # ---------- 初始化 ----------
-    model = ODEModel(hidden_dim=32, num_layers=2)
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
     def weights_init(m):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, mean=0, std=0.005)  # 将权重初始化为很小的随机值
@@ -323,7 +252,6 @@ def fit_population(
     except Exception as e:
         print(f"JIT compilation failed: {e}. Running in eager mode.")
 
-<<<<<<< HEAD
     # --------- Minibatch Dataloader Setup -----------
     patient_pids = list(patient_data.keys())
     use_minibatch = batch_size < len(patient_pids)
@@ -652,49 +580,3 @@ with torch.no_grad():
         f.write("Model structure:\n")
         f.write(str(model))
         f.write(f"MSE: {loss:.4f}")
-=======
-    a = {}
-    b = {}
-    for pid, dat in patient_data.items():
-        max_, min_ = dat['t'].max(), dat['t'].min()
-        a[pid] = torch.rand(1) * 4.0
-        low = -10 - a[pid] * min_
-        high = 20 - a[pid] * max_
-        b[pid] = low + torch.rand(1) * (high - low)
-
-    opt_w  = optim.Adam(model.parameters(), lr=adam_lr_w, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.MultiStepLR(opt_w, milestones=list(range(60, 151)), gamma=0.99, last_epoch=-1)
-
-    for it in range(n_epochs):
-        loss = torch.zeros(4)
-        sigma = torch.zeros(4)
-        # update model parameters
-        for k in range(4):
-            for l in range(param_update_steps):
-                loss_k = torch.tensor(0.0,requires_grad=True)
-                for pid, dat in patient_data.items():
-                    loss_k = loss_k + traj_loss(model, dat, a[pid], b[pid])
-                
-                loss_k.backward()
-                opt_w.step()
-            sigma_k = loss_k / (len(patient_data)+2*it-4)
-            loss[k] = loss_k.item()
-            sigma[k] = sigma_k.item()
-
-        # update ab
-        for i in range(it):
-            for pid, dat in patient_data.items():
-                opt_ab = optim.Adam([a[pid], b[pid]], lr=adam_lr_ab)
-                loss_j = torch.tensor(0.0,requires_grad=True)
-                for l in range(param_update_steps):
-                    loss_j = loss_j + traj_loss(model, dat, a[pid], b[pid], sigma)
-                loss_j.backward()
-                opt_ab.step()
-
-        if it%20 == 0:
-            print(f"Epoch {it} loss: {loss.mean()}")
-
-    return model, a, b
-
-model, a, b = fit_population(patient_data)
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
