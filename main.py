@@ -10,11 +10,8 @@ import os
 from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
 
-name = 'original'
-discription = 'This is original code simulating algorithm 1 in the paper'
-
 # ------------------ 加载数据 ------------------
-csf_dict = pc.load_csf_data()
+csf_dict = pc.load_data()
 print("Number of valid patients:", len(csf_dict))
 
 patient_data = {}
@@ -25,34 +22,6 @@ for pid, sample in csf_dict.items():
 
 print("Valid patients: ", len(patient_data))
 
-import torch.nn as nn
-
-class Gaussian(nn.Module):
-    """
-    Gaussian activation function.
-    Applies the element-wise function:
-    Gaussian(x) = exp(-x^2)
-    
-    Shape:
-        - Input: (N, *) where * means, any number of additional
-          dimensions
-        - Output: (N, *), same shape as the input
-    """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return torch.exp(-torch.pow(x, 2))
-
-# ---------- 计算y的分位数并保存为全局变量B, C, D ----------
-# 收集所有患者的y数据
-all_y_data = torch.cat([dat['y'] for dat in patient_data.values()], dim=0)
-
-# 计算5分位数、50分位数（中位数）和95分位数
-B = torch.quantile(all_y_data, 0.05, dim=0)  # 5分位数
-C = torch.quantile(all_y_data, 0.50, dim=0)  # 50分位数（中位数）
-D = torch.quantile(all_y_data, 0.95, dim=0)  # 95分位数
-
 Message = f"This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters."
 name = 'fpp'
 
@@ -60,11 +29,11 @@ class ODEModel(nn.Module):
     def __init__(self, hidden_dim=32, num_layers=2):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(4, hidden_dim),
+            nn.Linear(4, 4096),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(4096, 2048),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 4),
+            nn.Linear(2048, 4),
             nn.Tanh()
         )
                 # fA: wa0 + wa1*A + wa2*A^2
@@ -228,6 +197,7 @@ class PatientDataset(Dataset):
 
 def fit_population(
         patient_data,
+        hidden_dim=16,
         n_adam      = 300,      # adam 阶段迭代次数
         batch_size=128,
         opt_w_lr=1e-3,
@@ -237,7 +207,7 @@ def fit_population(
     sigma = torch.ones(4)
 
     # ---------- 初始化 ----------
-    model = ODEModel(hidden_dim=64, num_layers=3)
+    model = ODEModel(hidden_dim=hidden_dim)
     def weights_init(m):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, mean=0, std=0.005)  # 将权重初始化为很小的随机值
