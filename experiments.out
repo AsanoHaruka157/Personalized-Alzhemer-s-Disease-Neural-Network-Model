@@ -156,4 +156,49 @@ ODEModel(
     (4): Linear(in_features=64, out_features=4, bias=True)
     (5): Tanh()
   )
-)MSE: 0.0431
+)MSE: 0.0431fppTime: 2025-08-30 22:29:57
+This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=16, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=16, out_features=4, bias=True)
+    (3): Tanh()
+  )
+)MSE: 0.0424fppTime: 2025-08-30 22:41:06
+This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=4, bias=True)
+    (1): Tanh()
+  )
+)MSE: 0.0432fppTime: 2025-08-30 22:53:42
+This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=1024, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=1024, out_features=4, bias=True)
+    (3): Tanh()
+  )
+)MSE: 0.0430fppTime: 2025-08-30 23:08:09
+This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=4096, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=4096, out_features=4, bias=True)
+    (3): Tanh()
+  )
+)MSE: 0.0436fppTime: 2025-08-31 00:46:07
+This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters.Model structure:
+ODEModel(
+  (net): Sequential(
+    (0): Linear(in_features=4, out_features=4096, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=4096, out_features=2048, bias=True)
+    (3): ReLU()
+    (4): Linear(in_features=2048, out_features=4, bias=True)
+    (5): Tanh()
+  )
+)MSE: 0.0438

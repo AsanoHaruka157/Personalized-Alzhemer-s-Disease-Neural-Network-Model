@@ -71,7 +71,6 @@ def load_stage_dict():
             stage_dict[rid] = stage
     return stage_dict
 
-<<<<<<< HEAD
 def inv_nor(data, k=None):
     mean_std = np.load('mean_std.npy')
     
@@ -85,13 +84,3 @@ def inv_nor(data, k=None):
         original_data = (data * stds) + means
     
     return original_data
-=======
-def sampling(csf_dict, lenth=2, num=1):
-    sh_list = []
-    for key in csf_dict:
-        sh = csf_dict[key].shape[0]
-        if sh >= lenth:
-            sh_list.append(key)
-
-    return random.sample(sh_list, num)
->>>>>>> 47820850003ccd5bb3d8b9a53a794d0819d12900
