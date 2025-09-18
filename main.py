@@ -10,6 +10,59 @@ import os
 from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
 
+# ------------------ 自定义简单激活函数层 ------------------
+class special_activation_layer(nn.Module):
+    """
+    自定义激活函数层，将神经元分成前后两部分：
+    前半部分使用tanh激活函数，后半部分使用sin激活函数
+    """
+    def __init__(self, num_neurons):
+        super(special_activation_layer, self).__init__()
+        self.num_neurons = num_neurons
+        
+        # 计算分割点
+        self.split_point = num_neurons // 2
+        
+    def forward(self, x):
+        """
+        前向传播，前半部分用tanh，后半部分用sin
+        Args:
+            x: 输入张量，形状为 (batch_size, num_neurons) 或 (num_neurons,)
+        Returns:
+            激活后的张量
+        """
+        # 处理一维和二维输入
+        if x.dim() == 1:
+            # 一维输入，形状为 (num_neurons,)
+            x = x.unsqueeze(0)  # 转换为 (1, num_neurons)
+            is_1d = True
+        else:
+            is_1d = False
+            
+        output = torch.zeros_like(x)
+        
+        # 前半部分使用tanh激活函数
+        if self.split_point > 0:
+            output[:, :self.split_point] = torch.tanh(x[:, :self.split_point])
+        
+        # 后半部分使用sin激活函数
+        if self.split_point < self.num_neurons:
+            output[:, self.split_point:] = torch.sin(x[:, self.split_point:])
+        
+        # 如果输入是一维的，输出也保持一维
+        if is_1d:
+            output = output.squeeze(0)
+            
+        return output
+    
+    def get_activation_info(self):
+        """
+        获取激活函数分布信息
+        Returns:
+            激活函数分布描述
+        """
+        return f"前{self.split_point}个神经元使用tanh，后{self.num_neurons - self.split_point}个神经元使用sin"
+
 # ------------------ 加载数据 ------------------
 csf_dict = pc.load_data()
 print("Number of valid patients:", len(csf_dict))
@@ -22,18 +75,16 @@ for pid, sample in csf_dict.items():
 
 print("Valid patients: ", len(patient_data))
 
-Message = f"This is a simple FNN model plus polynomial model with fixed pretrained DPS parameters."
-name = 'fpp'
+Message = f"This is a FNN with wide special activation layer plus polynomial model with fixed pretrained DPS parameters."
+name = 'fpp_wide_special'
 
 class ODEModel(nn.Module):
     def __init__(self, hidden_dim=32, num_layers=2):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(4, 4096),
-            nn.ReLU(),
-            nn.Linear(4096, 2048),
-            nn.ReLU(),
-            nn.Linear(2048, 4),
+            nn.Linear(4, 8192),
+            special_activation_layer(8192),
+            nn.Linear(8192, 4),
             nn.Tanh()
         )
                 # fA: wa0 + wa1*A + wa2*A^2
@@ -198,9 +249,10 @@ class PatientDataset(Dataset):
 def fit_population(
         patient_data,
         hidden_dim=16,
-        n_adam      = 300,      # adam 阶段迭代次数
+        n_adam      = 180,      # adam 阶段迭代次数
         batch_size=128,
         opt_w_lr=1e-3,
+        print_interval = 10,
         weighted_sampling=True,
         early_stop_patience=80,
         early_stop_threshold=0.001):
@@ -409,7 +461,7 @@ def fit_population(
                 sigma = torch.ones(4) # Fallback if no residuals calculated
 
         # ----------- 监控 ----------
-        if (it+1) % 50 == 0:
+        if (it+1) % print_interval == 0:
             print(f"iter {it+1:02d}/{n_adam} | "
                   f"Adam | "
                   f"Batch MSE={loss_w.item():.4f} | "
