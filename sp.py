@@ -63,44 +63,41 @@ class ODEModel(nn.Module):
         def p(v):  # raw parameter that softplus->v
             return nn.Parameter(torch.tensor(_inv_softplus(v)))
 
-        # A self-dynamics: +a1*A - a2*A^2
-        self.a1 = p(0.30)
-        self.a2 = p(0.10)
+        # Logistic growth parameters: r*y*(1-y/K)
+        # A
+        self.rA = p(0.1)
+        self.KA = p(2.0)
+        # T
+        self.rT = p(0.1)
+        self.KT = p(2.0)
+        # N
+        self.rN = p(0.1)
+        self.KN = p(2.0)
+        # C
+        self.rC = p(0.11)
+        self.KC = p(2.0)
 
-        # T self-dynamics + coupling from A: +t1*T - t2*T^2 + at2*A^2 - at1*A*T
-        self.t1 = p(0.25)
-        self.t2 = p(0.08)
+        # Coupling terms
         self.at2 = p(init_small)  # A^2 -> T ( + )
         self.at1 = p(init_small)  # A*T ( - )
-
-        # N self-dynamics + coupling from T: +n1*N - n2*N^2 + tt2*T^2 - tn1*T*N
-        self.n1 = p(0.20)
-        self.n2 = p(0.06)
         self.tt2 = p(init_small)  # T^2 -> N ( + )
         self.tn1 = p(init_small)  # T*N ( - )
-
-        # C self-dynamics + impairment from N: +c1*C - c2*C^2 - nc1*N*C
-        self.c1 = p(0.12)
-        self.c2 = p(0.04)
         self.nc1 = p(init_small)  # N*C ( - )
 
     def poly(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         A, T, N, C = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
 
-        # dA/ds = +a1*A - a2*A^2
-        dA = _pos(self.a1) * A - _pos(self.a2) * (A * A)
+        # Logistic self-dynamics
+        dA_self = _pos(self.rA) * A * (1 - A / _pos(self.KA))
+        dT_self = _pos(self.rT) * T * (1 - T / _pos(self.KT))
+        dN_self = _pos(self.rN) * N * (1 - N / _pos(self.KN))
+        dC_self = _pos(self.rC) * C * (1 - C / _pos(self.KC))
 
-        # dT/ds = +t1*T - t2*T^2 + at2*A^2 - at1*A*T
-        dT = _pos(self.t1) * T - _pos(self.t2) * (T * T) \
-             + _pos(self.at2) * (A * A) - _pos(self.at1) * (A * T)
-
-        # dN/ds = +n1*N - n2*N^2 + tt2*T^2 - tn1*T*N
-        dN = _pos(self.n1) * N - _pos(self.n2) * (N * N) \
-             + _pos(self.tt2) * (T * T) - _pos(self.tn1) * (T * N)
-
-        # dC/ds = +c1*C - c2*C^2 - nc1*N*C
-        dC = _pos(self.c1) * C - _pos(self.c2) * (C * C) \
-             - _pos(self.nc1) * (N * C)
+        # Full equations with coupling
+        dA = dA_self
+        dT = dT_self + _pos(self.at2) * (A * A) - _pos(self.at1) * (A * T)
+        dN = dN_self + _pos(self.tt2) * (T * T) - _pos(self.tn1) * (T * N)
+        dC = dC_self - _pos(self.nc1) * (N * C)
         
         p = torch.stack([dA, dT, dN, dC], dim=-1)
         return p
@@ -112,9 +109,9 @@ class ODEModel(nn.Module):
             y_i = ys[-1]
 
             k1 = f_fn(y_i, s_grid[i - 1])
-            k2 = f_fn(y_i + 0.5 * h * k1, s_grid[i - 1])
-            k3 = f_fn(y_i + 0.5 * h * k2, s_grid[i - 1])
-            k4 = f_fn(y_i + h * k3, s_grid[i - 1])
+            k2 = f_fn(y_i + 0.5 * h * k1, s_grid[i - 1] + 0.5 * h)
+            k3 = f_fn(y_i + 0.5 * h * k2, s_grid[i - 1] + 0.5 * h)
+            k4 = f_fn(y_i + h * k3, s_grid[i])
 
             y_next = y_i + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
             ys.append(y_next)
@@ -127,18 +124,21 @@ class ODEModel(nn.Module):
 
 
 def calculate_global_loss(model, s_global, y_global, y0_global, sigma=None, tail_penalty_factor=0.0):
-    # 预测整个轨迹（仅多项式）
+    if s_global.numel() == 0:
+        return torch.tensor(0.0, device=s_global.device, dtype=s_global.dtype, requires_grad=True)
+
     y_pred_global = model(s_global, y0_global)
     loss = (y_pred_global - y_global) ** 2
 
     if tail_penalty_factor > 0:
         s_detached = s_global.detach()
-        s_min = s_detached.min()
-        s_max = s_detached.max()
-        if s_max > s_min:
-            # Linearly scale weights from 1 to 1+factor
-            weights = 1.0 + tail_penalty_factor * (s_detached - s_min) / (s_max - s_min)
-            loss = loss * weights.unsqueeze(-1)
+        if s_detached.numel() > 0:
+            s_min = s_detached.min()
+            s_max = s_detached.max()
+            if s_max > s_min:
+                # Linearly scale weights from 1 to 1+factor
+                weights = 1.0 + tail_penalty_factor * (s_detached - s_min) / (s_max - s_min)
+                loss = loss * weights.unsqueeze(-1)
 
     if sigma is not None:
         loss = loss * sigma
@@ -159,15 +159,17 @@ class PatientDataset(Dataset):
 def fit_population(
     patient_data,
     y0_global,
-    n_epochs=10,
+    n_epochs=5,
     max_iter_w=20,
     max_iter_dps=20,
     batch_size=128,
-    lr_w=5e-2,
-    lr_dps=5e-2,
+    lr_w=1e-3,
+    lr_dps=1e-3,
     weighted_sampling=True,
     inducement_weight=1e-3,
-    tail_penalty_factor=50.0,
+    tail_penalty_factor=1.0,
+    boundary_penalty_weight=1.0,
+    dps_init_method='pretrain',
 ):
     sigma = torch.ones(4)
 
@@ -200,50 +202,56 @@ def fit_population(
         z = (-y[:, 0]) + (y[:, 1]) + (-y[:, 2]) + (y[:, 3])
         pid_to_score[pid] = float(z.mean())
 
-    stage_dict = pc.load_stage_dict()
-
-    # 加载预训练的DPS参数
-    try:
-        ab = torch.load('dps.pth')
-        print("Successfully loaded pretrained DPS parameters from dps.pth")
-        for pid in list(ab.keys()):
-            if pid not in patient_data:
-                del ab[pid]
-                continue
-            if 'theta' in ab[pid]:
-                ab[pid]['theta'] = ab[pid]['theta'].detach().requires_grad_(True)
-            else:
-                alpha, beta = ab[pid]
-                ab[pid] = {'theta': alpha, 'beta': beta} # This will fail later, but keep original logic
-    except FileNotFoundError:
-        print("Warning: dps.pth not found. Computing a,b from age to stage mapping.")
-        ab = {}
+    ab = {}
+    if dps_init_method == 'new':
+        # Initialize DPS parameters from scratch with randomization
+        print("Initializing DPS parameters randomly to cover [-10, 20].")
         for pid, dat in patient_data.items():
-            stage = stage_dict.get(pid, 'Other')
-            t = dat['t']
-            if stage == 'CN':
-                s_range = (-10.0, 0.0)
-            elif stage == 'LMCI':
-                s_range = (0.0, 10.0)
-            elif stage == 'AD':
-                s_range = (10.0, 20.0)
-            else:
-                s_range = (-5.0, 5.0)
-            t_min, t_max = t.min().item(), t.max().item()
-            s_min, s_max = s_range[0], s_range[1]
-            if abs(t_max - t_min) < 1e-6:
-                a = 1.0
-                b = s_min - a * t_min
-            else:
-                a = (s_max - s_min) / (t_max - t_min)
-                b = s_min - a * t_min
-            a = max(a, 1e-4)
-            # theta0 = torch.log(torch.tensor(a - 1e-4)) # This is inverse of softplus: log(exp(y)-1) which is complicated.
-            # a = softplus(theta0)+eps. Let's use an approximation, assuming a is small.
-            # a is close to softplus(a).
-            theta0 = torch.tensor(a)
-            theta1 = torch.tensor(b)
-            ab[pid] = {'theta': torch.tensor([theta0.item(), theta1.item()], requires_grad=True)}
+            # Randomly initialize theta0, then compute 'a'
+            theta0 = torch.randn(1).item()
+            a_init = 4.0 * torch.sigmoid(torch.tensor(theta0))
+
+            # Initialize 'b' such that mean(s) is random within [-10, 20]
+            t_mean = dat['t'].mean()
+            s_target_mean = torch.rand(1).item() * 30.0 - 10.0 # Random value in [-10, 20]
+            b_init = s_target_mean - a_init * t_mean
+            theta1 = torch.tensor(b_init)
+            
+            theta = torch.tensor([theta0, theta1.item()], dtype=torch.float32, requires_grad=True)
+            ab[pid] = {"theta": theta}
+            
+    elif dps_init_method == 'pretrain':
+        # 加载预训练的DPS参数
+        try:
+            ab = torch.load('dps.pth')
+            print("Successfully loaded pretrained DPS parameters from dps.pth")
+            for pid in list(ab.keys()):
+                if pid not in patient_data:
+                    del ab[pid]
+                    continue
+                if 'theta' in ab[pid]:
+                    ab[pid]['theta'] = ab[pid]['theta'].detach().requires_grad_(True)
+                else:
+                    alpha, beta = ab[pid]
+                    ab[pid] = {'theta': alpha, 'beta': beta} # This will fail later, but keep original logic
+        except FileNotFoundError:
+            print("Warning: dps.pth not found. Falling back to 'new' random initialization.")
+            # Fallback to 'new' method
+            for pid, dat in patient_data.items():
+                # Randomly initialize theta0, then compute 'a'
+                theta0 = torch.randn(1).item()
+                a_init = 4.0 * torch.sigmoid(torch.tensor(theta0))
+
+                # Initialize 'b' such that mean(s) is random within [-10, 20]
+                t_mean = dat['t'].mean()
+                s_target_mean = torch.rand(1).item() * 30.0 - 10.0 # Random value in [-10, 20]
+                b_init = s_target_mean - a_init * t_mean
+                theta1 = torch.tensor(b_init)
+                
+                theta = torch.tensor([theta0, theta1.item()], dtype=torch.float32, requires_grad=True)
+                ab[pid] = {"theta": theta}
+    else:
+        raise ValueError(f"Unknown dps_init_method: '{dps_init_method}'. Choose 'new' or 'pretrain'.")
 
     # --------- 训练循环 -----------
     for epoch in range(n_epochs):
@@ -270,25 +278,23 @@ def fit_population(
             all_y_values = []
             for pid in valid_pids_in_batch:
                 dat = patient_data[pid]
-                a = F.softplus(ab[pid]['theta'][0]).item() + 1e-4
+                a = 4.0 * torch.sigmoid(ab[pid]['theta'][0]).item()
                 b = ab[pid]['theta'][1].item()
                 s_values = a * dat['t'] + b
                 y_values = dat['y']
                 all_s_values.append(s_values)
                 all_y_values.append(y_values)
-
+            
             s_global = torch.cat(all_s_values)
             y_global = torch.cat(all_y_values)
             s_global_sorted, sort_indices = torch.sort(s_global)
             y_global_sorted = y_global[sort_indices]
 
-            s_5_percentile = torch.quantile(s_global_sorted, 0.05)
-            s_95_percentile = torch.quantile(s_global_sorted, 0.95)
-            mask = (s_global_sorted >= s_5_percentile) & (s_global_sorted <= s_95_percentile)
-            s_global_filtered = s_global_sorted[mask]
-            y_global_filtered = y_global_sorted[mask]
+            loss = calculate_global_loss(
+                model, s_global_sorted, y_global_sorted, y0_global,
+                sigma=sigma, tail_penalty_factor=tail_penalty_factor
+            )
 
-            loss = calculate_global_loss(model, s_global_filtered, y_global_filtered, y0_global, sigma=sigma, tail_penalty_factor=tail_penalty_factor)
             if torch.isnan(loss):
                 return loss
             loss.backward()
@@ -305,9 +311,10 @@ def fit_population(
             all_s_values = []
             all_y_values = []
             induce_loss = 0.0
+            boundary_penalty = 0.0
             for pid in valid_pids_in_batch:
                 dat = patient_data[pid]
-                a = F.softplus(ab[pid]['theta'][0]) + 1e-4
+                a = 4.0 * torch.sigmoid(ab[pid]['theta'][0])
                 b = ab[pid]['theta'][1]
                 s_values = a * dat['t'] + b
                 y_values = dat['y']
@@ -317,21 +324,21 @@ def fit_population(
                 z_pid = pid_to_score[pid]
                 induce_loss += -z_pid * (a + b)
 
+                below = torch.clamp(-10.0 - s_values, min=0.0)
+                above = torch.clamp(s_values - 20.0, min=0.0)
+                boundary_penalty += (below.pow(2) + above.pow(2)).mean()
 
             s_global = torch.cat(all_s_values)
             y_global = torch.cat(all_y_values)
             s_global_sorted, sort_indices = torch.sort(s_global)
             y_global_sorted = y_global[sort_indices]
-            
-            s_5_percentile = torch.quantile(s_global_sorted, 0.05)
-            s_95_percentile = torch.quantile(s_global_sorted, 0.95)
-            mask = (s_global_sorted >= s_5_percentile) & (s_global_sorted <= s_95_percentile)
-            s_global_filtered = s_global_sorted[mask]
-            y_global_filtered = y_global_sorted[mask]
 
-            mse_loss = calculate_global_loss(model, s_global_filtered, y_global_filtered, y0_global, sigma=sigma, tail_penalty_factor=tail_penalty_factor)
+            mse_loss = calculate_global_loss(
+                model, s_global_sorted, y_global_sorted, y0_global,
+                sigma=sigma, tail_penalty_factor=tail_penalty_factor
+            )
             
-            total_loss = mse_loss + inducement_weight * induce_loss
+            total_loss = mse_loss + inducement_weight * induce_loss + boundary_penalty_weight * boundary_penalty
 
             if torch.isnan(total_loss):
                 return total_loss
@@ -343,74 +350,64 @@ def fit_population(
         print(f"Epoch {epoch+1:02d}/{n_epochs} | Loss_w={loss_w.item():.4f} | Loss_dps={loss_dps.item():.4f}")
 
         with torch.no_grad():
-            # This logic needs to be inside the closure to be part of the graph, but let's update sigma once per epoch
             all_s_values = []
             all_y_values = []
             for pid in valid_pids_in_batch:
                 dat = patient_data[pid]
-                a = F.softplus(ab[pid]['theta'][0]).item() + 1e-4
+                a = 4.0 * torch.sigmoid(ab[pid]['theta'][0]).item()
                 b = ab[pid]['theta'][1].item()
                 s_values = a * dat['t'] + b
                 all_s_values.append(s_values)
                 all_y_values.append(dat['y'])
+            
             s_global = torch.cat(all_s_values)
             y_global = torch.cat(all_y_values)
             s_global_sorted, sort_indices = torch.sort(s_global)
             y_global_sorted = y_global[sort_indices]
-            s_5_percentile = torch.quantile(s_global_sorted, 0.05)
-            s_95_percentile = torch.quantile(s_global_sorted, 0.95)
-            mask = (s_global_sorted >= s_5_percentile) & (s_global_sorted <= s_95_percentile)
-            s_global_filtered = s_global_sorted[mask]
-            y_global_filtered = y_global_sorted[mask]
-            
-            y_pred = model(s_global_filtered, y0_global)
-            new_sigma = (y_pred - y_global_filtered) ** 2
-            if torch.any(new_sigma):
-                sigma = new_sigma.mean(dim=0)
-            else:
-                sigma = torch.ones(4)
+
+            if s_global_sorted.numel() > 0:
+                y_pred_filtered = model(s_global_sorted, y0_global)
+                new_sigma = (y_pred_filtered - y_global_sorted) ** 2
+                if torch.any(new_sigma):
+                    sigma = new_sigma.mean(dim=0)
+                else:
+                    sigma = torch.ones(4)
 
 
     model.eval()
-    return model
+    return model, ab
 
 
-model = fit_population(patient_data, y0_cn_avg)
+model, trained_ab = fit_population(patient_data, y0_cn_avg)
 
 try:
     torch.save(model.state_dict(), f'{name}.pth')
+    torch.save(trained_ab, f'dps_{name}.pth')
+    print(f"Successfully saved model to {name}.pth and dps parameters to dps_{name}.pth")
 except Exception as e:
     print(f"Error saving model: {e}")
 
 
-# ---------- 绘制人群四联图 (根据s的10%和90%分位数) -----------------
+# ---------- 绘制人群四联图 (根据s的5%和95%分位数) -----------------
 with torch.no_grad():
-    # 收集所有患者的s值
-    ab = torch.load('dps.pth')
+    ab = trained_ab  # Use the trained DPS parameters
+
     all_s_values = []
     for p in patient_data:
-        a = F.softplus(ab[p]['theta'][0]).item() + 1e-4
+        a = 4.0 * torch.sigmoid(ab[p]['theta'][0]).item()
         b = ab[p]['theta'][1]
         s_values = a * patient_data[p]['t'] + b
         all_s_values.append(s_values)
-
+    
     all_s_flat = torch.cat(all_s_values)
-    s_10_percentile = torch.quantile(all_s_flat, 0.10)
-    s_90_percentile = torch.quantile(all_s_flat, 0.90)
+    s_min = all_s_flat.min().item()
+    s_max = all_s_flat.max().item()
 
-    print(f"S value range: 10th percentile = {s_10_percentile:.2f}, 90th percentile = {s_90_percentile:.2f}")
+    print(f"Plotting s value range: [{s_min:.2f}, {s_max:.2f}]")
 
-    s_min = s_10_percentile
-    s_max = s_90_percentile
     s_curve = torch.linspace(s_min, s_max, 100)
 
-    keep = []
-    for p in patient_data:
-        a = F.softplus(ab[p]['theta'][0]).item() + 1e-4
-        b = ab[p]['theta'][1]
-        s_values = a * patient_data[p]['t'] + b
-        if torch.any((s_values >= s_min) & (s_values <= s_max)):
-            keep.append(p)
+    keep = patient_data.keys()
 
     stage_dict = pc.load_stage_dict()
 
@@ -430,7 +427,7 @@ with torch.no_grad():
         y_by_stage = {'CN': [], 'LMCI': [], 'AD': [], 'Other': []}
 
         for p in keep:
-            a = F.softplus(ab[p]['theta'][0]).item() + 1e-4
+            a = 4.0 * torch.sigmoid(ab[p]['theta'][0]).item()
             b = ab[p]['theta'][1]
             stage = stage_dict.get(p, 'Other')
             if stage not in s_by_stage:
@@ -439,10 +436,8 @@ with torch.no_grad():
             s_values = a * patient_data[p]['t'] + b
             y_values = patient_data[p]['y'][:, k]
 
-            mask = (s_values >= s_min) & (s_values <= s_max)
-            if torch.any(mask):
-                s_by_stage[stage].append(s_values[mask])
-                y_by_stage[stage].append(y_values[mask])
+            s_by_stage[stage].append(s_values)
+            y_by_stage[stage].append(y_values)
 
         colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
         for stage, s_points_list in s_by_stage.items():
@@ -458,7 +453,7 @@ with torch.no_grad():
         ax.set_ylabel(TITLES[k])
         ax.legend(fontsize=8)
 
-    fig2.suptitle(f'Population Model (Poly only) (s in 10-90 percentile: [{float(s_min):.2f}, {float(s_max):.2f}])')
+    fig2.suptitle(f'Population Model (Poly only) (s range: [{float(s_min):.2f}, {float(s_max):.2f}])')
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(f'{name}.png')
     plt.show()
@@ -470,7 +465,7 @@ with torch.no_grad():
     loss = 0
     with torch.no_grad():
         for pid in patient_data:
-            a = F.softplus(ab[pid]['theta'][0]).item() + 1e-4
+            a = 4.0 * torch.sigmoid(ab[pid]['theta'][0]).item()
             b = ab[pid]['theta'][1]
             s = a * patient_data[pid]['t'] + b
             y_pred = model(s, patient_data[pid]['y0'])
@@ -478,14 +473,30 @@ with torch.no_grad():
             loss += eval_global_loss(y_pred, patient_data[pid]['y']) / len(y_pred)
         loss /= len(patient_data)
 
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    output_filename = 'experiments.out'
-    with open(output_filename, 'a') as f:
-        f.write(name)
-        f.write(f"Time: {current_time}\n")
-        f.write(Message)
-        f.write("Model structure:\n")
-        f.write(str(model))
-        f.write(f"MSE: {loss:.4f}")
+print("\n--- Trained ODE Model Equations ---")
+with torch.no_grad():
+    # A
+    rA = _pos(model.rA).item()
+    KA = _pos(model.KA).item()
+    print(f"dA/ds = {rA:.4f}*A*(1 - A/{KA:.4f})")
 
+    # T
+    rT = _pos(model.rT).item()
+    KT = _pos(model.KT).item()
+    at2 = _pos(model.at2).item()
+    at1 = _pos(model.at1).item()
+    print(f"dT/ds = {rT:.4f}*T*(1 - T/{KT:.4f}) + {at2:.4f}*A^2 - {at1:.4f}*A*T")
 
+    # N
+    rN = _pos(model.rN).item()
+    KN = _pos(model.KN).item()
+    tt2 = _pos(model.tt2).item()
+    tn1 = _pos(model.tn1).item()
+    print(f"dN/ds = {rN:.4f}*N*(1 - N/{KN:.4f}) + {tt2:.4f}*T^2 - {tn1:.4f}*T*N")
+
+    # C
+    rC = _pos(model.rC).item()
+    KC = _pos(model.KC).item()
+    nc1 = _pos(model.nc1).item()
+    print(f"dC/ds = {rC:.4f}*C*(1 - C/{KC:.4f}) - {nc1:.4f}*N*C")
+print("---------------------------------\n")

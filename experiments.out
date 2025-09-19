@@ -270,4 +270,26 @@ ODEModel()MSE: 0.2414spTime: 2025-09-17 19:32:39
 Polynomial-only model with fixed pretrained DPS parameters.Model structure:
 ODEModel()MSE: 0.0564spTime: 2025-09-17 19:43:48
 Polynomial-only model with fixed pretrained DPS parameters.Model structure:
-ODEModel()MSE: 0.0773
+ODEModel()MSE: 0.0773spTime: 2025-09-18 14:50:53
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0442spTime: 2025-09-18 14:53:27
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0454spTime: 2025-09-18 14:58:48
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0455spTime: 2025-09-18 15:03:07
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0455spTime: 2025-09-18 15:18:19
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0455spTime: 2025-09-18 15:39:53
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0455spTime: 2025-09-18 15:51:59
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0454spTime: 2025-09-18 16:08:04
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 0.0451spTime: 2025-09-18 16:18:49
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 1050430889000960.0000spTime: 2025-09-18 21:42:58
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: nanspTime: 2025-09-18 22:02:04
+Polynomial-only model with fixed pretrained DPS parameters.Model structure:
+ODEModel()MSE: 1.0634

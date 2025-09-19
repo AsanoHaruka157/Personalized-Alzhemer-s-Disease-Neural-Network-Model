@@ -4,7 +4,7 @@ import numpy as np
 import pccmnn as pc
 
 # 加载数据：与 main.py 一致
-csf_dict = pc.load_csf_data()
+csf_dict = pc.load_data()
 print("Number of valid patients:", len(csf_dict))
 
 # 阶段信息
@@ -81,7 +81,7 @@ def interval_penalty(s_values: torch.Tensor, interval: tuple) -> torch.Tensor:
     return penalty.mean()
 
 def pretrain_dps(patient_data: dict, stage_dict: dict, epochs: int = 500, lr: float = 1e-2,
-                 weight_reg: float = 1e-3, verbose: bool = True):
+                 weight_reg: float = 1e-3, verbose: bool = True, variance_penalty_weight: float = 0.01):
     """
     最简单的连续诱导：不设 target。
     - 每位患者计算一个分数 z_pid = mean((-Aβ) + (+Tau) + (-N) + (+C))。
@@ -89,6 +89,7 @@ def pretrain_dps(patient_data: dict, stage_dict: dict, epochs: int = 500, lr: fl
         loss_pid = -(z_pid) * (a + b) + λ*(a^2 + b^2) + 边界惩罚
       其中 a=4*sigmoid(θ0)+eps ∈ (0,4]，b=θ1，自然满足 a≤4。
     - s = a*t + b，并对 s 超出 [-10,20] 的部分加二次惩罚。
+    - New: Add a variance maximization term to the loss to encourage s to spread out.
     初始化：a=1, b=0（通过选择 θ0=logit(1/4)，θ1=0）。
     返回: ab（包含 θ）
     """
@@ -111,29 +112,48 @@ def pretrain_dps(patient_data: dict, stage_dict: dict, epochs: int = 500, lr: fl
 
     for ep in range(epochs):
         optimizer.zero_grad()
-        total_loss = 0.0
+
+        all_s_for_epoch = []
+        pid_to_s_vals = {}
+        pid_to_alpha_beta = {}
+
+        # First, compute all s_vals and alpha/beta for the current epoch state
         for pid, dat in patient_data.items():
             t = dat['t']
             theta = ab[pid]['theta']
-            # α ∈ (0,4]
             alpha = 4.0 * torch.sigmoid(theta[0]) + 1e-4
             beta = theta[1]
             s_vals = alpha * t + beta
+            all_s_for_epoch.append(s_vals)
+            pid_to_s_vals[pid] = s_vals
+            pid_to_alpha_beta[pid] = (alpha, beta)
 
-            # 诱导项：-(z_pid)*(a+b)
+        # Calculate variance penalty across all patients
+        s_global = torch.cat(all_s_for_epoch)
+        s_variance = torch.var(s_global)
+        
+        # We want to MAXIMIZE variance, so we MINIMIZE its negative
+        variance_loss = -variance_penalty_weight * s_variance
+
+        # Now calculate the other loss terms for each patient and aggregate
+        other_losses = 0.0
+        for pid, dat in patient_data.items():
+            s_vals = pid_to_s_vals[pid]
+            alpha, beta = pid_to_alpha_beta[pid]
+
             z_pid = pid_to_score[pid]
-            induce = - z_pid * (alpha + beta)
+            induce = -z_pid * (alpha + beta)
 
-            # s 边界惩罚（超出 [-10,20] 的部分二次惩罚）
-            below = torch.clamp(-10.0 - s_vals, min=0.0)
-            above = torch.clamp(s_vals - 20.0, min=0.0)
-            bound_penalty = (below.pow(2) + above.pow(2)).mean()
+            below_bound = torch.clamp(-10.0 - s_vals, min=0.0)
+            above_bound = torch.clamp(s_vals - 20.0, min=0.0)
+            bound_penalty = (below_bound.pow(2) + above_bound.pow(2)).mean()
 
-            # 轻微 L2 正则
             reg_loss = weight_reg * (alpha.pow(2) + beta.pow(2))
-
-            total_loss = total_loss + induce + bound_penalty + reg_loss
-
+            
+            other_losses += induce + bound_penalty + reg_loss
+        
+        total_loss = other_losses + variance_loss
+        
         total_loss.backward()
         optimizer.step()
         if verbose and (ep % 50 == 0 or ep == epochs - 1):
@@ -151,7 +171,7 @@ def plot_dps_scatter(patient_data: dict, stage_dict: dict, ab: dict, save_path: 
         stage = stage_dict.get(pid, 'Other')
         color = stage_colors.get(stage, 'grey')
         theta = ab[pid]['theta'].detach()
-        alpha = F.softplus(theta[0]).item() + 1e-4
+        alpha = 4.0 * torch.sigmoid(theta[0]).item()
         beta = theta[1].item()
         s_vals = alpha * dat['t'] + beta
         s_points.append(s_vals)
@@ -161,14 +181,7 @@ def plot_dps_scatter(patient_data: dict, stage_dict: dict, ab: dict, save_path: 
     s_all = torch.cat(s_points).numpy()
     y_all = torch.cat(y_points).numpy()
     y_all_orig = pc.inv_nor(y_all)
-
-    # 仅对 s 按 10% 与 90% 分位做过滤
-    s10 = np.quantile(s_all, 0.5)
-    s90 = np.quantile(s_all, 0.95)
-    mask_s = (s_all >= s10) & (s_all <= s90)
-    s_all = s_all[mask_s]
-    y_all_orig = y_all_orig[mask_s]
-    color_points = np.array(color_points)[mask_s]
+    color_points = np.array(color_points)
 
     titles = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
     fig, axes = plt.subplots(2, 2, figsize=(9, 6))
@@ -189,7 +202,7 @@ def plot_dps_scatter(patient_data: dict, stage_dict: dict, ab: dict, save_path: 
 if __name__ == '__main__':
     # 构建 patient_data 结构并进行 DPS 预训练与绘制
     patient_data = build_patient_data(csf_dict)
-    ab, _ = pretrain_dps(patient_data, stage_dict, epochs=400, lr=5e-2, verbose=True)
+    ab, _ = pretrain_dps(patient_data, stage_dict, epochs=200, lr=5e-2, verbose=True, variance_penalty_weight=50)
     model_path = 'dps.pth'
     torch.save(ab, model_path)
     print(f"Saved DPS parameters to {model_path}")
