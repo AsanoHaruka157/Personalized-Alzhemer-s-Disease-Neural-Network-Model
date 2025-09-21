@@ -81,7 +81,8 @@ def interval_penalty(s_values: torch.Tensor, interval: tuple) -> torch.Tensor:
     return penalty.mean()
 
 def pretrain_dps(patient_data: dict, stage_dict: dict, epochs: int = 500, lr: float = 1e-2,
-                 weight_reg: float = 1e-3, verbose: bool = True, variance_penalty_weight: float = 0.01):
+                 weight_reg: float = 1e-3, verbose: bool = True, 
+                 variance_penalty_weight: float = 0.1, inducement_weight: float = 0.5):
     """
     最简单的连续诱导：不设 target。
     - 每位患者计算一个分数 z_pid = mean((-Aβ) + (+Tau) + (-N) + (+C))。
@@ -137,22 +138,26 @@ def pretrain_dps(patient_data: dict, stage_dict: dict, epochs: int = 500, lr: fl
 
         # Now calculate the other loss terms for each patient and aggregate
         other_losses = 0.0
+        boundary_penalty_sum = 0.0
+        inducement_loss_sum = 0.0
+        
         for pid, dat in patient_data.items():
             s_vals = pid_to_s_vals[pid]
             alpha, beta = pid_to_alpha_beta[pid]
 
             z_pid = pid_to_score[pid]
-            induce = -z_pid * (alpha + beta)
+            inducement_loss_sum += -z_pid * (alpha + beta)
 
             below_bound = torch.clamp(-10.0 - s_vals, min=0.0)
             above_bound = torch.clamp(s_vals - 20.0, min=0.0)
-            bound_penalty = (below_bound.pow(2) + above_bound.pow(2)).mean()
+            boundary_penalty_sum += (below_bound.pow(2) + above_bound.pow(2)).mean()
 
             reg_loss = weight_reg * (alpha.pow(2) + beta.pow(2))
             
-            other_losses += induce + bound_penalty + reg_loss
-        
-        total_loss = other_losses + variance_loss
+            other_losses += reg_loss # reg_loss is per-patient
+
+        # Boundary penalty weight is implicitly 1.0 here
+        total_loss = inducement_weight * inducement_loss_sum + boundary_penalty_sum + other_losses + variance_loss
         
         total_loss.backward()
         optimizer.step()
@@ -202,7 +207,8 @@ def plot_dps_scatter(patient_data: dict, stage_dict: dict, ab: dict, save_path: 
 if __name__ == '__main__':
     # 构建 patient_data 结构并进行 DPS 预训练与绘制
     patient_data = build_patient_data(csf_dict)
-    ab, _ = pretrain_dps(patient_data, stage_dict, epochs=200, lr=5e-2, verbose=True, variance_penalty_weight=50)
+    ab, _ = pretrain_dps(patient_data, stage_dict, epochs=800, lr=5e-2, verbose=True, 
+                         variance_penalty_weight=0.1, inducement_weight=2)
     model_path = 'dps.pth'
     torch.save(ab, model_path)
     print(f"Saved DPS parameters to {model_path}")

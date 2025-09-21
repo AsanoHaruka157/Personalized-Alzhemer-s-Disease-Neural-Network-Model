@@ -65,16 +65,16 @@ class ODEModel(nn.Module):
 
         # Logistic growth parameters: r*y*(1-y/K)
         # A
-        self.rA = p(0.1)
+        self.rA = p(0.01)
         self.KA = p(2.0)
         # T
-        self.rT = p(0.1)
+        self.rT = p(0.01)
         self.KT = p(2.0)
         # N
-        self.rN = p(0.1)
+        self.rN = p(0.01)
         self.KN = p(2.0)
         # C
-        self.rC = p(0.11)
+        self.rC = p(0.01)
         self.KC = p(2.0)
 
         # Coupling terms
@@ -88,10 +88,10 @@ class ODEModel(nn.Module):
         A, T, N, C = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
 
         # Logistic self-dynamics
-        dA_self = _pos(self.rA) * A * (1 - A / _pos(self.KA))
-        dT_self = _pos(self.rT) * T * (1 - T / _pos(self.KT))
-        dN_self = _pos(self.rN) * N * (1 - N / _pos(self.KN))
-        dC_self = _pos(self.rC) * C * (1 - C / _pos(self.KC))
+        dA_self = (_pos(self.rA) + 0.01) * A * (1 - A / _pos(self.KA))
+        dT_self = (_pos(self.rT) + 0.01) * T * (1 - T / _pos(self.KT))
+        dN_self = (_pos(self.rN) + 0.01) * N * (1 - N / _pos(self.KN))
+        dC_self = (_pos(self.rC) + 0.01) * C * (1 - C / _pos(self.KC))
 
         # Full equations with coupling
         dA = dA_self
@@ -156,26 +156,46 @@ class PatientDataset(Dataset):
         return self.pids[idx]
 
 
+def pack_params(model):
+    return np.concatenate([p.data.detach().numpy().flatten() for p in model.parameters()])
+
+def unpack_params(model, params_flat):
+    offset = 0
+    for p in model.parameters():
+        numel = p.numel()
+        p.data = torch.from_numpy(params_flat[offset:offset + numel]).view_as(p.data)
+        offset += numel
+
+def pack_dps_params(ab):
+    return np.concatenate([ab[pid]['theta'].detach().numpy().flatten() for pid in sorted(ab.keys())])
+
+def unpack_dps_params(ab, params_flat):
+    offset = 0
+    for pid in sorted(ab.keys()):
+        numel = ab[pid]['theta'].numel()
+        ab[pid]['theta'] = torch.from_numpy(params_flat[offset:offset + numel]).view_as(ab[pid]['theta'])
+        offset += numel
+    return ab
+
 def fit_population(
     patient_data,
     y0_global,
-    n_epochs=5,
+    n_epochs=10,
     max_iter_w=20,
     max_iter_dps=20,
     batch_size=128,
     lr_w=1e-3,
     lr_dps=1e-3,
     weighted_sampling=True,
-    inducement_weight=1e-3,
-    tail_penalty_factor=1.0,
-    boundary_penalty_weight=1.0,
+    inducement_weight=1e-1,
+    boundary_penalty_weight=50.0,
+    variance_penalty_weight=0.05,
     dps_init_method='pretrain',
 ):
     sigma = torch.ones(4)
-
-    # ---------- 初始化 ----------
     model = ODEModel()
 
+    # ---------- 初始化 ----------
     # --------- Minibatch Dataloader Setup -----------
     patient_pids = list(patient_data.keys())
     use_minibatch = batch_size < len(patient_pids)
@@ -194,14 +214,13 @@ def fit_population(
         dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
         batch_iterator = iter(dataloader)
 
-    # Pre-calculate scores for inducement term
+    # Pre-calculate scores for inducement term (now removed from loss)
     pid_to_score = {}
     for pid, dat in patient_data.items():
         y = dat['y']
-        # Score: higher means more "diseased"
         z = (-y[:, 0]) + (y[:, 1]) + (-y[:, 2]) + (y[:, 3])
         pid_to_score[pid] = float(z.mean())
-
+    
     ab = {}
     if dps_init_method == 'new':
         # Initialize DPS parameters from scratch with randomization
@@ -253,23 +272,13 @@ def fit_population(
     else:
         raise ValueError(f"Unknown dps_init_method: '{dps_init_method}'. Choose 'new' or 'pretrain'.")
 
-    # --------- 训练循环 -----------
-    for epoch in range(n_epochs):
-        if use_minibatch:
-            try:
-                batch_pids = next(batch_iterator)
-            except StopIteration:
-                print("Batch iterator exhausted.")
-                break
-        else:
-            batch_pids = patient_pids
+    # --------- LBFGS Training Loop -----------
+    patient_pids = list(patient_data.keys())
+    valid_pids_in_batch = patient_pids # Assuming no minibatching for simplicity of revert, can be added back
 
-        batch_pids_list = [pid.item() for pid in batch_pids] if use_minibatch else batch_pids
-        valid_pids_in_batch = [pid for pid in batch_pids_list if patient_data[pid]['t'].shape[0] >= 2 and pid in ab]
-        if not valid_pids_in_batch:
-            continue
-        
-        # --- Optimize polynomial parameters (w) ---
+    for epoch in range(n_epochs):
+
+        # --- Optimize polynomial parameters (w) using LBFGS ---
         opt_w = optim.LBFGS(model.parameters(), max_iter=max_iter_w, lr=lr_w)
 
         def closure_w():
@@ -281,67 +290,107 @@ def fit_population(
                 a = 4.0 * torch.sigmoid(ab[pid]['theta'][0]).item()
                 b = ab[pid]['theta'][1].item()
                 s_values = a * dat['t'] + b
-                y_values = dat['y']
                 all_s_values.append(s_values)
-                all_y_values.append(y_values)
+                all_y_values.append(dat['y'])
             
             s_global = torch.cat(all_s_values)
             y_global = torch.cat(all_y_values)
+            
             s_global_sorted, sort_indices = torch.sort(s_global)
             y_global_sorted = y_global[sort_indices]
 
+            # --- ROBUST FIX for duplicates ---
+            if s_global_sorted.numel() > 0:
+                unique_mask = torch.cat([
+                    torch.tensor([True]), 
+                    s_global_sorted[1:] != s_global_sorted[:-1]
+                ])
+                unique_s = s_global_sorted[unique_mask]
+                unique_y = y_global_sorted[unique_mask]
+            else:
+                unique_s = s_global_sorted
+                unique_y = y_global_sorted
+            
             loss = calculate_global_loss(
-                model, s_global_sorted, y_global_sorted, y0_global,
-                sigma=sigma, tail_penalty_factor=tail_penalty_factor
+                model, unique_s, unique_y, y0_global,
+                sigma=sigma
             )
-
-            if torch.isnan(loss):
-                return loss
+        
             loss.backward()
             return loss
 
         loss_w = opt_w.step(closure_w)
 
-        # --- Optimize DPS parameters (theta) ---
+        # --- Optimize DPS parameters (theta) using LBFGS ---
         dps_params = [ab[pid]['theta'] for pid in valid_pids_in_batch]
         opt_dps = optim.LBFGS(dps_params, max_iter=max_iter_dps, lr=lr_dps)
         
         def closure_dps():
             opt_dps.zero_grad()
-            all_s_values = []
-            all_y_values = []
-            induce_loss = 0.0
-            boundary_penalty = 0.0
+            
+            all_s_for_epoch = []
+            pid_to_s_vals = {}
+            pid_to_alpha_beta = {}
+
+            # First, compute all s_vals and alpha/beta for the current epoch state
             for pid in valid_pids_in_batch:
                 dat = patient_data[pid]
-                a = 4.0 * torch.sigmoid(ab[pid]['theta'][0])
-                b = ab[pid]['theta'][1]
-                s_values = a * dat['t'] + b
-                y_values = dat['y']
-                all_s_values.append(s_values)
-                all_y_values.append(y_values)
+                theta = ab[pid]['theta']
+                alpha = 4.0 * torch.sigmoid(theta[0])
+                beta = theta[1]
+                s_vals = alpha * dat['t']
+                all_s_for_epoch.append(s_vals)
+                pid_to_s_vals[pid] = s_vals
+                pid_to_alpha_beta[pid] = (alpha, beta)
 
-                z_pid = pid_to_score[pid]
-                induce_loss += -z_pid * (a + b)
+            # Calculate variance penalty across all patients
+            s_global = torch.cat(all_s_for_epoch)
+            s_variance = torch.var(s_global)
+            variance_loss = -variance_penalty_weight * s_variance
 
-                below = torch.clamp(-10.0 - s_values, min=0.0)
-                above = torch.clamp(s_values - 20.0, min=0.0)
-                boundary_penalty += (below.pow(2) + above.pow(2)).mean()
-
-            s_global = torch.cat(all_s_values)
+            # Calculate other loss components
+            all_y_values = [patient_data[pid]['y'] for pid in valid_pids_in_batch]
             y_global = torch.cat(all_y_values)
             s_global_sorted, sort_indices = torch.sort(s_global)
             y_global_sorted = y_global[sort_indices]
 
+            # --- ROBUST FIX for duplicates ---
+            if s_global_sorted.numel() > 0:
+                unique_mask = torch.cat([
+                    torch.tensor([True]), 
+                    s_global_sorted[1:] != s_global_sorted[:-1]
+                ])
+                unique_s = s_global_sorted[unique_mask]
+                unique_y = y_global_sorted[unique_mask]
+            else:
+                unique_s = s_global_sorted
+                unique_y = y_global_sorted
+
             mse_loss = calculate_global_loss(
-                model, s_global_sorted, y_global_sorted, y0_global,
-                sigma=sigma, tail_penalty_factor=tail_penalty_factor
+                model, unique_s, unique_y, y0_global,
+                sigma=sigma
             )
             
-            total_loss = mse_loss + inducement_weight * induce_loss + boundary_penalty_weight * boundary_penalty
+            inducement_loss = 0.0
+            boundary_penalty = 0.0
+            for pid in valid_pids_in_batch:
+                s_vals = pid_to_s_vals[pid]
+                alpha, beta = pid_to_alpha_beta[pid]
+                
+                # Inducement term
+                z_pid = pid_to_score[pid]
+                inducement_loss += -z_pid * (alpha + beta)
 
-            if torch.isnan(total_loss):
-                return total_loss
+                # Boundary penalty
+                below = torch.clamp(-10.0 - s_vals, min=0.0)
+                above = torch.clamp(s_vals - 20.0, min=0.0)
+                boundary_penalty += (below.pow(2) + above.pow(2)).mean()
+
+            total_loss = (mse_loss + 
+                          inducement_weight * inducement_loss + 
+                          boundary_penalty * boundary_penalty_weight + 
+                          variance_loss)
+
             total_loss.backward()
             return total_loss
 
@@ -364,21 +413,32 @@ def fit_population(
             y_global = torch.cat(all_y_values)
             s_global_sorted, sort_indices = torch.sort(s_global)
             y_global_sorted = y_global[sort_indices]
-
+            
+            # --- ROBUST FIX for duplicates ---
             if s_global_sorted.numel() > 0:
-                y_pred_filtered = model(s_global_sorted, y0_global)
-                new_sigma = (y_pred_filtered - y_global_sorted) ** 2
+                unique_mask = torch.cat([
+                    torch.tensor([True]), 
+                    s_global_sorted[1:] != s_global_sorted[:-1]
+                ])
+                unique_s = s_global_sorted[unique_mask]
+                unique_y = y_global_sorted[unique_mask]
+            else:
+                unique_s = s_global_sorted
+                unique_y = y_global_sorted
+
+            if unique_s.numel() > 0:
+                y_pred = model(unique_s, y0_global)
+                new_sigma = (y_pred - unique_y) ** 2
                 if torch.any(new_sigma):
                     sigma = new_sigma.mean(dim=0)
                 else:
                     sigma = torch.ones(4)
 
-
     model.eval()
     return model, ab
 
 
-model, trained_ab = fit_population(patient_data, y0_cn_avg)
+model, trained_ab = fit_population(patient_data, y0_cn_avg, n_epochs=10, max_iter_w=20, max_iter_dps=20)
 
 try:
     torch.save(model.state_dict(), f'{name}.pth')
@@ -476,26 +536,26 @@ with torch.no_grad():
 print("\n--- Trained ODE Model Equations ---")
 with torch.no_grad():
     # A
-    rA = _pos(model.rA).item()
+    rA = (_pos(model.rA) + 0.01).item()
     KA = _pos(model.KA).item()
     print(f"dA/ds = {rA:.4f}*A*(1 - A/{KA:.4f})")
 
     # T
-    rT = _pos(model.rT).item()
+    rT = (_pos(model.rT) + 0.01).item()
     KT = _pos(model.KT).item()
     at2 = _pos(model.at2).item()
     at1 = _pos(model.at1).item()
     print(f"dT/ds = {rT:.4f}*T*(1 - T/{KT:.4f}) + {at2:.4f}*A^2 - {at1:.4f}*A*T")
 
     # N
-    rN = _pos(model.rN).item()
+    rN = (_pos(model.rN) + 0.01).item()
     KN = _pos(model.KN).item()
     tt2 = _pos(model.tt2).item()
     tn1 = _pos(model.tn1).item()
     print(f"dN/ds = {rN:.4f}*N*(1 - N/{KN:.4f}) + {tt2:.4f}*T^2 - {tn1:.4f}*T*N")
 
     # C
-    rC = _pos(model.rC).item()
+    rC = (_pos(model.rC) + 0.01).item()
     KC = _pos(model.KC).item()
     nc1 = _pos(model.nc1).item()
     print(f"dC/ds = {rC:.4f}*C*(1 - C/{KC:.4f}) - {nc1:.4f}*N*C")
