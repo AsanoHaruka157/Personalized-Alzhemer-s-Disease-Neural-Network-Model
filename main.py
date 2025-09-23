@@ -1,604 +1,293 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import copy
 import matplotlib.pyplot as plt
 import numpy as np
-import torch.nn.functional as F
 import pccmnn as pc
-import os
-from torch.utils.data import Dataset, DataLoader
-from datetime import datetime
+try:
+    from torchdiffeq import odeint as torch_odeint
+except ImportError:
+    raise ImportError("Please install torchdiffeq to run this script: pip install torchdiffeq")
 
-# ------------------ 自定义简单激活函数层 ------------------
-class special_activation_layer(nn.Module):
-    """
-    自定义激活函数层，将神经元分成前后两部分：
-    前半部分使用tanh激活函数，后半部分使用sin激活函数
-    """
-    def __init__(self, num_neurons):
-        super(special_activation_layer, self).__init__()
-        self.num_neurons = num_neurons
-        
-        # 计算分割点
-        self.split_point = num_neurons // 2
-        
-    def forward(self, x):
-        """
-        前向传播，前半部分用tanh，后半部分用sin
-        Args:
-            x: 输入张量，形状为 (batch_size, num_neurons) 或 (num_neurons,)
-        Returns:
-            激活后的张量
-        """
-        # 处理一维和二维输入
-        if x.dim() == 1:
-            # 一维输入，形状为 (num_neurons,)
-            x = x.unsqueeze(0)  # 转换为 (1, num_neurons)
-            is_1d = True
-        else:
-            is_1d = False
-            
-        output = torch.zeros_like(x)
-        
-        # 前半部分使用tanh激活函数
-        if self.split_point > 0:
-            output[:, :self.split_point] = torch.tanh(x[:, :self.split_point])
-        
-        # 后半部分使用sin激活函数
-        if self.split_point < self.num_neurons:
-            output[:, self.split_point:] = torch.sin(x[:, self.split_point:])
-        
-        # 如果输入是一维的，输出也保持一维
-        if is_1d:
-            output = output.squeeze(0)
-            
-        return output
-    
-    def get_activation_info(self):
-        """
-        获取激活函数分布信息
-        Returns:
-            激活函数分布描述
-        """
-        return f"前{self.split_point}个神经元使用tanh，后{self.num_neurons - self.split_point}个神经元使用sin"
-
-# ------------------ 加载数据 ------------------
+# --- 0. 資料載入和準備 ---
 csf_dict = pc.load_data()
-print("Number of valid patients:", len(csf_dict))
+stage_dict = pc.load_stage_dict()
+print(f"成功載入 {len(csf_dict)} 位患者的資料。")
 
 patient_data = {}
 for pid, sample in csf_dict.items():
-    t = torch.from_numpy(sample[:, 0]).float()            # 年龄
-    y = torch.from_numpy(sample[:, 1:5]).float()          # biomarker A/T/N/C
+    t = torch.from_numpy(sample[:, 0]).float()
+    y = torch.from_numpy(sample[:, 1:5]).float()
     patient_data[pid] = {"t": t, "y": y, "y0": y[0].clone()}
 
-print("Valid patients: ", len(patient_data))
+def get_cn_average_y0(patient_data, stage_dict):
+    cn_y0s = []
+    for pid, data in patient_data.items():
+        if stage_dict.get(pid) == 'CN':
+            cn_y0s.append(data['y0'])
+    if not cn_y0s:
+        print("警告: 未找到CN患者, 使用預設y0。")
+        return torch.tensor([0.1, 0, 0, 0])
+    avg_y0 = torch.stack(cn_y0s).mean(dim=0)
+    print(f"使用CN群體的平均初始值: {avg_y0.numpy()}")
+    return avg_y0
 
-Message = f"This is a FNN with wide special activation layer plus polynomial model with fixed pretrained DPS parameters."
-name = 'fpp_wide_special'
+y0_cn_avg = get_cn_average_y0(patient_data, stage_dict)
+name = 'fpp'
 
+# --- 1. 定義混合ODE模型 ---
 class ODEModel(nn.Module):
-    def __init__(self, hidden_dim=32, num_layers=2):
+    def __init__(self, hidden_dim=1024):
         super().__init__()
+        # 1a. 神經網路部分 f(y)
         self.net = nn.Sequential(
-            nn.Linear(4, 8192),
-            special_activation_layer(8192),
-            nn.Linear(8192, 4),
-            nn.Tanh()
+            nn.Linear(4, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 4),
+            nn.Tanh()  # **策略2: 使用Tanh限制輸出範圍**
         )
-                # fA: wa0 + wa1*A + wa2*A^2
-        self.wa0 = torch.nn.Parameter(torch.tensor(0.01))
-        self.wa1 = torch.nn.Parameter(torch.tensor(0.01))  # A linear negative
-        self.wa2 = torch.nn.Parameter(torch.tensor(-0.01))
+        self.output_scaler = nn.Parameter(torch.tensor([0.1]), requires_grad=True) # 縮放Tanh輸出
 
-        # fT: wt0 + wt1*A + wt2*A^2 + wt3*T + wt4*T^2 + wt5*A*T
-        self.wt0  = torch.nn.Parameter(torch.tensor(0.01))
-        self.wt1 = torch.nn.Parameter(torch.tensor(-0.01))  # A term negative
-        self.wt2  = torch.nn.Parameter(torch.tensor(-0.01))  # T term positive
-        self.wt3 = torch.nn.Parameter(torch.tensor(0.01))
-        self.wt4 = torch.nn.Parameter(torch.tensor(0.01))
-        self.wt5 = torch.nn.Parameter(torch.tensor(-0.01))
+        # 1b. 多項式部分 p(y)
+        self.wA = nn.Parameter(torch.zeros(3))
+        self.wT = nn.Parameter(torch.zeros(6))
+        self.wN = nn.Parameter(torch.zeros(6))
+        self.wC = nn.Parameter(torch.zeros(6))
 
-        # fN: wn0 + wn1*T + wn2*T^2 + wn3*N + wn4*N^2 + wn5*T*N
-        self.wn0  = torch.nn.Parameter(torch.tensor(0.01))
-        self.wn1 = torch.nn.Parameter(torch.tensor(-0.01))  # T term positive
-        self.wn2  = torch.nn.Parameter(torch.tensor(-0.01))  # N term negative
-        self.wn3 = torch.nn.Parameter(torch.tensor(0.01))
-        self.wn4 = torch.nn.Parameter(torch.tensor(0.01))
-        self.wn5 = torch.nn.Parameter(torch.tensor(-0.01))
+        self._initialize_weights()
 
-        # fC: wc0 + wc1*C + wc2*C^2 + wc3*N + wc4*N^2 + wc5*N*C
-        self.wc0  = torch.nn.Parameter(torch.tensor(0.01))
-        self.wc1 = torch.nn.Parameter(torch.tensor(-0.01))  # N term negative
-        self.wc2  = torch.nn.Parameter(torch.tensor(-0.01))  # C term positive
-        self.wc3 = torch.nn.Parameter(torch.tensor(0.01))
-        self.wc4 = torch.nn.Parameter(torch.tensor(0.01))
-        self.wc5 = torch.nn.Parameter(torch.tensor(-0.01))
+    def _initialize_weights(self):
+        """ **策略4: 初始化權重為非常小的值** """
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0, std=1e-3) # 使用非常小的標準差
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
+    def load_poly_params(self, path='poly.pth'):
+        try:
+            poly_coeffs = torch.load(path)
+            self.wA.data = poly_coeffs['wA']
+            self.wT.data = poly_coeffs['wT']
+            self.wN.data = poly_coeffs['wN']
+            self.wC.data = poly_coeffs['wC']
+            print(f"成功從 {path} 載入預訓練的多項式模型係數。")
+        except FileNotFoundError:
+            print(f"警告: 未找到 {path}。")
 
-    def poly(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def poly(self, y: torch.Tensor) -> torch.Tensor:
         A, T, N, C = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
-        fA = self.wa0 + self.wa1 * A + self.wa2 * (A * A)
-        fT = (
-            self.wt0 + self.wt1 * A + self.wt2 * A**2 +
-            self.wt3 * T + self.wt4 * T**2 + self.wt5 * (A * T)
-        )
-        fN = (
-            self.wn0 + self.wn1 * N + self.wn2 * N**2 +
-            self.wn3 * T + self.wn4 * T**2 + self.wn5 * (T * N)
-        )
-        fC = (
-            self.wc0 + self.wc1 * C + self.wc2 * C**2 +
-            self.wc3 * N + self.wc4 * N**2 + self.wc5 * (N * C)
-        )
-        p = torch.stack([fA, fT, fN, fC], dim=-1)
-        return p
+        phi_A = torch.stack([torch.ones_like(A), A, A**2], dim=-1)
+        phi_T = torch.stack([torch.ones_like(T), T, T**2, A, A**2, A*T], dim=-1)
+        phi_N = torch.stack([torch.ones_like(N), N, N**2, T, T**2, T*N], dim=-1)
+        phi_C = torch.stack([torch.ones_like(C), C, C**2, N, N**2, N*C], dim=-1)
+        dAds = (phi_A @ self.wA)
+        dTds = (phi_T @ self.wT)
+        dNds = (phi_N @ self.wN)
+        dCds = (phi_C @ self.wC)
+        return torch.stack([dAds, dTds, dNds, dCds], dim=-1)
 
-    def f(self, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        return self.net(y)+self.poly(y, s)
+    def f(self, y: torch.Tensor) -> torch.Tensor:
+        return self.net(y) * self.output_scaler
 
-    def _rk4_integrate(self, s_grid: torch.Tensor, y0: torch.Tensor, f_fn) -> torch.Tensor:
-        ys = [y0]
-        for i in range(1, len(s_grid)):
-            h = s_grid[i] - s_grid[i - 1]
-            y_i = ys[-1]
-
-            k1 = f_fn(y_i, s_grid[i - 1])
-            k2 = f_fn(y_i + 0.5 * h * k1, s_grid[i - 1])
-            k3 = f_fn(y_i + 0.5 * h * k2, s_grid[i - 1])
-            k4 = f_fn(y_i + h * k3, s_grid[i - 1])
-
-            y_next = y_i + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-            ys.append(y_next)
-
-        return torch.stack(ys)
-
-    def forward(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
-        # Full model: poly(y)*net(y)
-        return self._rk4_integrate(s_grid, y0, self.f)
-
-    def forward_net_only(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
-        # Neural-only dynamics: dy/ds = net(y)
-        return self._rk4_integrate(s_grid, y0, lambda y, s: self.net(y))
-
-    def forward_poly_only(self, s_grid: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
-        # Polynomial-only dynamics: dy/ds = poly(y)
-        return self._rk4_integrate(s_grid, y0, lambda y, s: self.poly(y, s))
-
-def residual(model, s_global, y_global, sigma=None):
-    """
-    Calculates the global residual: dy/dt - f(y) for all data points.
-    where dy/dt is computed by finite difference (centered for interior, one-sided for endpoints).
-    Returns mean squared error of the residual across all data points.
-    """
-    # Compute dy/dt using finite differences
-    dy_dt = torch.zeros_like(y_global)
+    def combined_dynamics(self, s: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # torchdiffeq的函數簽名是 func(t, y)
+        return self.f(y) + self.poly(y)
     
-    # Forward difference for the first point
-    dy_dt[0] = (y_global[1] - y_global[0]) / (s_global[1] - s_global[0])
-    # Centered difference for interior points
-    if len(s_global) > 2:
-        dy_dt[1:-1] = (y_global[2:] - y_global[:-2]) / (s_global[2:].unsqueeze(1) - s_global[:-2].unsqueeze(1))
-    # Backward difference for the last point
-    dy_dt[-1] = (y_global[-1] - y_global[-2]) / (s_global[-1] - s_global[-2])
+    def net_dynamics(self, s: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return self.f(y)
 
-    # Model prediction f(y) at each s, y
-    fy = torch.zeros_like(y_global)
-    for i in range(len(s_global)):
-        fy[i] = model.f(y_global[i], s_global[i])
+    def poly_dynamics(self, s: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return self.poly(y)
 
-    residual = dy_dt - fy
-    loss = residual ** 2
-    if sigma is not None:
-        loss = loss * sigma
+    def forward(self, s_grid: torch.Tensor, y0: torch.Tensor, dynamics='combined') -> torch.Tensor:
+        dynamics_map = {
+            'combined': self.combined_dynamics,
+            'net_only': self.net_dynamics,
+            'poly_only': self.poly_dynamics
+        }
+        if dynamics not in dynamics_map:
+            raise ValueError("dynamics must be 'combined', 'net_only', or 'poly_only'")
+        
+        # **策略3: 調整容忍度**
+        return torch_odeint(dynamics_map[dynamics], y0, s_grid, method='dopri5', rtol=1e-4, atol=1e-5)
 
-    return loss.mean()
-
-
-def calculate_global_loss(model, s_global, y_global, sigma=None):
-    """
-    Calculates the global loss based on prediction from s=-10, y0=[0.1,0,0,0].
-    All s values are concatenated and sorted as s_global, then predict for all data points.
-    """
-    # 从s=-10, y0=[0.1,0,0,0]开始预测
-    s_start = torch.tensor(-10.0)
-    y0_global = torch.tensor([0.1, 0, 0, 0])
+# --- 2. 定義訓練流程 ---
+def calculate_loss(model, patient_data, ab, pids, y0, sigma=None, s_penalty_weight=0.0):
+    all_s_values, all_y_values = [], []
+    for pid in pids:
+        dat = patient_data[pid]
+        a = ab[pid]['a']
+        b = ab[pid]['b']
+        s_values = a * dat['t'] + b
+        all_s_values.append(s_values)
+        all_y_values.append(dat['y'])
     
-    # 预测整个轨迹
-    y_pred_global = model(s_global, y0_global)
+    s_global = torch.cat(all_s_values)
+    y_global = torch.cat(all_y_values)
     
-    # 计算MSE
-    loss = (y_pred_global - y_global)**2
-    if sigma is not None:
-        loss = loss * sigma
+    s_sorted, sort_indices = torch.sort(s_global)
+    y_sorted = y_global[sort_indices]
 
-    return loss.mean()
+    if s_sorted.numel() < 2: return torch.tensor(0.0)
 
-def calculate_combined_loss(model, s_global, y_global, sigma=None, r=0.5, s_penalty_weight=0.1):
-    """
-    Calculates a combined loss: r% residual and (1-r)% global.
-    Adds exponential penalty for s values outside [-10, 20] range.
-    """
-    #res = residual(model, s_global, y_global, sigma)
-    loss_global = calculate_global_loss(model, s_global, y_global, sigma)
-    '''
-    zero = torch.zeros(4)
-    one = torch.ones(4)
-    s_default = torch.tensor(0.0)
-    combined_loss = ( loss_global + res ) * torch.exp(torch.norm(model.f(B, s_default)) + torch.norm(model.f(D, s_default))) / (torch.norm(model.f(C, s_default)) + 1e-5)
-    '''
-    #combined_loss = r * res + (1-r) * loss_global
-    return loss_global
+    # --- **核心修改：S值範圍懲罰** ---
+    penalty = torch.tensor(0.0)
+    if s_penalty_weight > 0:
+        safe_min, safe_max = -15.0, 25.0
+        out_of_bounds_lower = torch.clamp(safe_min - s_sorted, min=0.0)
+        out_of_bounds_upper = torch.clamp(s_sorted - safe_max, min=0.0)
+        # 使用平方懲罰
+        penalty = s_penalty_weight * (out_of_bounds_lower.pow(2).mean() + out_of_bounds_upper.pow(2).mean())
 
+    try:
+        y_pred = model(s_sorted, y0)
+        mse_loss = ((y_pred - y_sorted) ** 2)
+        if torch.isnan(mse_loss).any():
+            return torch.tensor(float('inf')) # 如果求解失敗，返回無窮大loss
+        
+        if sigma is not None:
+            mse_loss = mse_loss * sigma.clamp(min=1e-4)
+        
+        total_loss = mse_loss.mean() + penalty
+        return total_loss
+        
+    except Exception as e:
+        # 捕獲求解器錯誤
+        return torch.tensor(float('inf'))
 
-import torch, torch.nn as nn, torch.optim as optim
-import torch.nn.functional as F
-from math import ceil
-
-class PatientDataset(Dataset):
-    def __init__(self, pids):
-        self.pids = pids
-
-    def __len__(self):
-        return len(self.pids)
-
-    def __getitem__(self, idx):
-        return self.pids[idx]
 
 def fit_population(
-        patient_data,
-        hidden_dim=16,
-        n_adam      = 180,      # adam 阶段迭代次数
-        batch_size=128,
-        opt_w_lr=1e-3,
-        print_interval = 10,
-        weighted_sampling=True,
-        early_stop_patience=80,
-        early_stop_threshold=0.001):
+    patient_data,
+    y0,
+    n_epochs=50,
+    lr_model=1e-3, # **建议: 降低学习率**
+    lr_lbfgs=1e-4,
+    clip_value=1.0,
+    s_penalty=1.0,
+    max_iter_lbfgs=10
+):
     sigma = torch.ones(4)
+    model = ODEModel()
+    model.load_poly_params()
 
-    # ---------- 初始化 ----------
-    model = ODEModel(hidden_dim=hidden_dim)
-    def weights_init(m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, mean=0, std=0.005)  # 将权重初始化为很小的随机值
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)  # 将偏置初始化为0
-    model.apply(weights_init)
-    
-    # Accelerate model with JIT compilation
+    # --- 策略: 冻结多项式模型的参数 ---
+    model.wA.requires_grad = False
+    model.wT.requires_grad = False
+    model.wN.requires_grad = False
+    model.wC.requires_grad = False
+
     try:
-        model = torch.jit.script(model)
-        print("Model successfully compiled with JIT.")
-    except Exception as e:
-        print(f"JIT compilation failed: {e}. Running in eager mode.")
-
-    # --------- Minibatch Dataloader Setup -----------
-    patient_pids = list(patient_data.keys())
-    use_minibatch = batch_size < len(patient_pids)
-
-    batch_iterator = None
-    if use_minibatch and n_adam > 0:
-        print(f"Using mini-batching with batch size {batch_size}.")
-        dataset = PatientDataset(patient_pids)
-        
-        sampler = None
-        if weighted_sampling:
-            print("Using weighted sampling based on the number of time points per patient.")
-            weights = [float(patient_data[pid]['t'].shape[0]) for pid in patient_pids]
-            sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=n_adam * batch_size, replacement=True)
-        
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
-        batch_iterator = iter(dataloader)
-
-    stage_dict = pc.load_stage_dict()
-    
-    # 加载预训练的DPS参数
-    try:
-        ab = torch.load('dps.pth')
-        print("Successfully loaded pretrained DPS parameters from dps.pth")
-        
-        # 将theta参数设置为不需要梯度，因为我们不再训练a,b
-        for pid in ab:
-            if 'theta' in ab[pid]:
-                ab[pid]['theta'] = ab[pid]['theta'].detach().requires_grad_(False)
-            else:
-                # 如果加载的是直接的alpha, beta值，转换为theta格式
-                alpha, beta = ab[pid]
-                ab[pid] = {'theta': alpha, 'beta': beta}
-                
-    except FileNotFoundError:
-        print("Warning: dps.pth not found. Computing a,b from age to stage mapping.")
+        dps_params_loaded = torch.load('dps.pth', weights_only=False)
         ab = {}
-        for pid, dat in patient_data.items():
-            stage = stage_dict.get(pid, 'Other')
-            t = dat['t']  # 年龄时间序列
-
-            # 根据stage确定s的范围
-            if stage == 'CN':
-                s_range = (-10.0, 0.0)
-            elif stage == 'LMCI':
-                s_range = (0.0, 10.0)
-            elif stage == 'AD':
-                s_range = (10.0, 20.0)
-            else:  # Default for 'Other' or missing stages
-                s_range = (-5.0, 5.0)
-            
-            # 线性变换：将年龄范围 [t_min, t_max] 映射到s范围 [s_min, s_max]
-            # s = a * t + b
-            # 求解：s_min = a * t_min + b, s_max = a * t_max + b
-            t_min, t_max = t.min().item(), t.max().item()
-            s_min, s_max = s_range[0], s_range[1]
-            
-            # 如果t_min == t_max，设置默认值
-            if abs(t_max - t_min) < 1e-6:
-                a = 1.0
-                b = s_min - a * t_min
-            else:
-                # 计算线性变换参数
-                a = (s_max - s_min) / (t_max - t_min)
-                b = s_min - a * t_min
-            
-            # 确保a > 0，并转换为theta格式
-            a = max(a, 1e-4)  # 确保a > 0
-            theta0 = torch.log(torch.tensor(a - 1e-4))
-            theta1 = torch.tensor(b)
-            
-            ab[pid] = {'theta': torch.tensor([theta0.item(), theta1.item()], requires_grad=False)}
-
-    # --------- Adam 优化器池 -----------
-    opt_w  = optim.Adam(model.parameters(), lr=opt_w_lr, weight_decay=1e-4)
-    # 不再需要a,b的优化器，因为我们不再训练这些参数
-    scheduler = optim.lr_scheduler.MultiStepLR(opt_w, milestones=list(range(60, 151)), gamma=0.99, last_epoch=-1)
-
-    # --------- 训练循环 -----------
-    training_stopped = False
-    # Early stopping state
-    early_stop_counter = 0
-    last_adam_loss = float('inf')
-    adam_loss_history = []
-
-    # 只更新模型参数w，a,b使用预训练参数
-    for it in range(n_adam):
-        # ======================== 更新 w (Adam) =========================
-        if use_minibatch:
-            try:
-                batch_pids = next(batch_iterator)
-            except StopIteration:
-                print("Batch iterator exhausted. This should not happen with the configured sampler.")
-                continue
-        else:
-            batch_pids = patient_pids
-
-        opt_w.zero_grad()
-        loss_w = 0.
+        for pid, params in dps_params_loaded.items():
+            if pid not in patient_data: continue
+            ab[pid] = {
+                'a': nn.Parameter(torch.tensor(params['a'], dtype=torch.float32)),
+                'b': nn.Parameter(torch.tensor(params['b'], dtype=torch.float32))
+            }
+        print("成功從 dps.pth 載入並創建可訓練的 a, b 參數。")
+    except FileNotFoundError:
+        print("錯誤: 未找到 dps.pth。")
+        return None, None
         
-        # Convert tensor PIDs to integer for dict lookup
-        batch_pids_list = [pid.item() for pid in batch_pids] if use_minibatch else batch_pids
-        valid_pids_in_batch = [pid for pid in batch_pids_list if patient_data[pid]['t'].shape[0] >= 2]
+    patient_pids = list(ab.keys())
+
+    # --- **策略2: 分離優化器** ---
+    dps_params = [p for pid in patient_pids for p in ab[pid].values()]
+    opt_model = optim.Adam(model.parameters(), lr=lr_model)
+
+    # --- 策略: 为多项式和DPS参数创建一个LBFGS微调优化器 ---
+    finetune_params = [model.wA, model.wT, model.wN, model.wC] + dps_params # **建议: 代码清理**
+    opt_finetune = optim.LBFGS(finetune_params, lr=lr_lbfgs, max_iter=max_iter_lbfgs, line_search_fn="strong_wolfe") # LBFGS for fine-tuning
+
+
+    for epoch in range(n_epochs):
+        # --- 步驟 3a: 優化模型參數 (NN) ---
+        opt_model.zero_grad()
+        loss_model = calculate_loss(model, patient_data, ab, patient_pids, y0, sigma, s_penalty_weight=0.0)
+        if torch.isfinite(loss_model):
+            loss_model.backward()
+            nn.utils.clip_grad_norm_(model.net.parameters(), clip_value) # 只裁剪被优化的参数
+            opt_model.step()
+
+        # --- 步驟 3b: 優化多项式和DPS参数 (LBFGS微调) ---
+        def closure_finetune():
+            opt_finetune.zero_grad()
+            loss = calculate_loss(model, patient_data, ab, patient_pids, y0, sigma, s_penalty_weight=s_penalty)
+            if torch.isfinite(loss):
+                loss.backward()
+            return loss
         
-        if not valid_pids_in_batch:
-            continue
+        loss_finetune = opt_finetune.step(closure_finetune)
 
-        # 收集所有患者的s值和y值
-        all_s_values = []
-        all_y_values = []
-        
-        for pid in valid_pids_in_batch:
-            dat = patient_data[pid]
-            a = F.softplus(ab[pid]['theta'][0]).item() + 1e-4
-            b = ab[pid]['theta'][1]
-            s_values = a * dat['t'] + b
-            y_values = dat['y']
-            
-            all_s_values.append(s_values)
-            all_y_values.append(y_values)
-        
-        # 拼接所有s值和y值
-        s_global = torch.cat(all_s_values)
-        y_global = torch.cat(all_y_values)
-        
-        # 对s_global排序，并相应重排y_global
-        s_global_sorted, sort_indices = torch.sort(s_global)
-        y_global_sorted = y_global[sort_indices]
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch+1:02d}/{n_epochs} | Loss Model={loss_model.item():.6f} | Loss Finetune={loss_finetune.item():.6f}")
 
-        # 过滤掉s_global_sorted的5%和95%分位数以外的数据
-        s_5_percentile = torch.quantile(s_global_sorted, 0.05)
-        s_95_percentile = torch.quantile(s_global_sorted, 0.95)
-        
-        # 创建过滤掩码
-        mask = (s_global_sorted >= s_5_percentile) & (s_global_sorted <= s_95_percentile)
-        
-        # 应用过滤
-        s_global_filtered = s_global_sorted[mask]
-        y_global_filtered = y_global_sorted[mask]
-        
-        # 计算全局损失（使用过滤后的数据）
-        loss_w = calculate_combined_loss(model, s_global_filtered, y_global_filtered, sigma=sigma)
-
-        # --- Early stopping and logging with moving average ---
-        adam_loss_history.append(loss_w.item())
-        if len(adam_loss_history) > 30: # Moving average window
-            adam_loss_history.pop(0)
-        current_avg_loss = sum(adam_loss_history) / len(adam_loss_history)
-
-        # --- Early stopping logic ---
-        if last_adam_loss != float('inf'):
-            relative_change = (last_adam_loss - current_avg_loss) / abs(last_adam_loss) if last_adam_loss != 0 else float('inf')
-            if relative_change < early_stop_threshold:
-                early_stop_counter += 1
-            else:
-                early_stop_counter = 0
-        last_adam_loss = current_avg_loss
-
-        if early_stop_counter >= early_stop_patience:
-            print(f"Iter {it+1:02d}: Early stopping. Loss improvement < {early_stop_threshold*100:.1f}% for {early_stop_patience} steps.")
-            break
-        # --- End early stopping logic ---
-
-        if torch.isnan(loss_w):
-            print(f"Iter {it+1:02d}: Adam loss for w is NaN. Stopping training.")
-            training_stopped = True
-        else:
-            loss_w.backward()
-            opt_w.step()
-            scheduler.step()
-
-        if training_stopped:
-            break
-
-        # ---------- 可选：估计 σk ----------
         with torch.no_grad():
-            y0 = torch.tensor([0.1, 0, 0, 0])
-            
-            # 预测整个轨迹
-            y_pred = model(s_global_filtered, y0)
-            sigma = (y_pred - y_global_filtered)**2
-            if torch.any(sigma):
-                sigma = sigma.mean(dim=0)
-            else:
-                sigma = torch.ones(4) # Fallback if no residuals calculated
+            loss_val = calculate_loss(model, patient_data, ab, patient_pids, y0)
+            if torch.isfinite(loss_val):
+                sigma = torch.full((4,), loss_val.item())
 
-        # ----------- 监控 ----------
-        if (it+1) % print_interval == 0:
-            print(f"iter {it+1:02d}/{n_adam} | "
-                  f"Adam | "
-                  f"Batch MSE={loss_w.item():.4f} | "
-                  f"Avg MSE={current_avg_loss:.4f}")
+    model.eval()
+    return model, ab
 
-    # --------- 输出 ----------
-    model.eval() # Switch to evaluation mode before returning
-    
-    return model
 
-model = fit_population(
-    patient_data)
+# --- 4. 訓練和繪圖 ---
+model, trained_ab = fit_population(patient_data, y0_cn_avg)
+if model is None:
+    exit()
 
-try:
-    torch.save(model.state_dict(), f'{name}.pth')
-except Exception as e:
-    print(f"Error saving model: {e} 喵！   _(┐ ◟;ﾟдﾟ)ノ")
+torch.save(model.state_dict(), f'{name}.pth')
+torch.save(trained_ab, f'dps_{name}.pth')
 
-# ---------- 2. 绘制人群四联图 (根据s的10%和90%分位数) -----------------
+# --- 繪圖 ---
 with torch.no_grad():
-    # 收集所有患者的s值（一致使用 softplus(θ0)+1e-4 作为 a）
-    ab = torch.load('dps.pth')
-    all_s_values = []
-    for p in patient_data:
-        a = F.softplus(ab[p]['theta'][0]).item() + 1e-4
-        b = ab[p]['theta'][1]
-        s_values = a * patient_data[p]['t'] + b
-        all_s_values.append(s_values)
+    s_grid = torch.linspace(-10, 20, 200)
+    
+    y_poly, y_net, y_combined = None, None, None
+    try:
+        y_poly = model(s_grid, y0_cn_avg, dynamics='poly_only').numpy()
+        y_net = model(s_grid, y0_cn_avg, dynamics='net_only').numpy()
+        y_combined = model(s_grid, y0_cn_avg, dynamics='combined').numpy()
+    except Exception as e:
+        print(f"繪圖時ODE求解失敗: {e}")
 
-    # 计算所有s值的10分位数和90分位数
-    all_s_flat = torch.cat(all_s_values)
-    s_10_percentile = torch.quantile(all_s_flat, 0.10)
-    s_90_percentile = torch.quantile(all_s_flat, 0.90)
-
-    print(f"S value range: 10th percentile = {s_10_percentile:.2f}, 90th percentile = {s_90_percentile:.2f}")
-
-    # 使用10分位数到90分位数的范围
-    s_min = s_10_percentile
-    s_max = s_90_percentile
-    s_curve = torch.linspace(s_min, s_max, 100)
-
-    # 过滤在10-90分位数范围内的数据点
-    keep = []
-    for p in patient_data:
-        a = F.softplus(ab[p]['theta'][0]).item() + 1e-4
-        b = ab[p]['theta'][1]
-        s_values = a * patient_data[p]['t'] + b
-        # 检查是否有任何s值在范围内
-        if torch.any((s_values >= s_min) & (s_values <= s_max)):
-            keep.append(p)
-
-    stage_dict = pc.load_stage_dict()
-
-    # 准备绘图数据 - 使用10分位数对应的y值作为起始点
-    y0_pop = torch.tensor([0.1,0,0,0])
-
-    # ---------- 添加新轨迹：从10分位数开始，分别计算完整/仅NN/仅多项式轨迹 ----------
-    y_curve_full = model(s_curve, y0_pop)
-    y_curve_net  = model.forward_net_only(s_curve, y0_pop)
-    y_curve_poly = model.forward_poly_only(s_curve, y0_pop)
-    y_curve_full = y_curve_full.detach().numpy()
-    y_curve_net  = y_curve_net.detach().numpy()
-    y_curve_poly = y_curve_poly.detach().numpy()
-    y_curve_full = pc.inv_nor(y_curve_full)
-    y_curve_net  = pc.inv_nor(y_curve_net)
-    y_curve_poly = pc.inv_nor(y_curve_poly)
-
+    if y_combined is None:
+        print("無法生成繪圖，因為最終模型求解失敗。")
+        exit()
+        
+    y_poly_orig = pc.inv_nor(y_poly)
+    y_net_orig = pc.inv_nor(y_net)
+    y_combined_orig = pc.inv_nor(y_combined)
+    
     TITLES = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
-
-    fig2, axes = plt.subplots(2, 2, figsize=(9, 6))
-    for k, ax in enumerate(axes.flat):
-        # --- 分阶段准备散点数据 ---
-        s_by_stage = {'CN': [], 'LMCI': [], 'AD': [], 'Other': []}
-        y_by_stage = {'CN': [], 'LMCI': [], 'AD': [], 'Other': []}
-
-        for p in keep:
-            a = F.softplus(ab[p]['theta'][0]).item() + 1e-4
-            b = ab[p]['theta'][1]
-            stage = stage_dict.get(p, 'Other')
-            if stage not in s_by_stage:
-                stage = 'Other'
-            
-            s_values = a * patient_data[p]['t'] + b
-            y_values = patient_data[p]['y'][:, k]
-            
-            # 只保留在10-90分位数范围内的数据点
-            mask = (s_values >= s_min) & (s_values <= s_max)
-            if torch.any(mask):
-                s_by_stage[stage].append(s_values[mask])
-                y_by_stage[stage].append(y_values[mask])
-
-        # --- 绘制散点 (分期颜色) ---
-        colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
-        for stage, s_points_list in s_by_stage.items():
-            if s_points_list:
-                s_all = torch.cat(s_points_list).numpy()
-                y_all = torch.cat(y_by_stage[stage]).numpy()
-                y_all = pc.inv_nor(y_all, k)
-                ax.scatter(s_all, y_all, s=15, alpha=0.6, c=colors[stage], label=stage)
+    colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+    axes = axes.flat
+    
+    for k in range(4):
+        ax = axes[k]
+        for pid, dat in patient_data.items():
+            if pid in trained_ab:
+                stage = stage_dict.get(pid, 'Other')
+                a = trained_ab[pid]['a'].item()
+                b = trained_ab[pid]['b'].item()
+                s = a * dat['t'].numpy() + b
+                y_orig = pc.inv_nor(dat['y'][:, k].numpy(), k)
+                ax.scatter(s, y_orig, s=10, alpha=0.4, c=colors[stage])
         
-        # --- 轨迹曲线：完整/仅NN/仅多项式 ---
-        ax.plot(s_curve, y_curve_full[:,k], lw=1.6, c='red', linestyle='--', label='Full (poly + net)')
-        ax.plot(s_curve, y_curve_net[:,k],  lw=1.2, c='purple', linestyle='-.', label='Net only')
-        ax.plot(s_curve, y_curve_poly[:,k], lw=1.2, c='teal', linestyle=':', label='Poly only')
-        
-        ax.set_xlabel('Disease progression score  s')
+        ax.plot(s_grid, y_poly_orig[:, k], 'g-.', lw=2, label='Polynomial Only', zorder=3)
+        ax.plot(s_grid, y_net_orig[:, k], 'b:', lw=2, label='NN Correction Only (f(y))', zorder=3)
+        ax.plot(s_grid, y_combined_orig[:, k], 'r-', lw=2.5, label='Combined (f(y) + p(y))', zorder=4)
+        ax.set_xlabel('Disease Progression Score (s)')
         ax.set_ylabel(TITLES[k])
-        ax.legend(fontsize=8)
-
-    fig2.suptitle(f'Population Model (s in 10-90 percentile: [{float(s_min):.2f}, {float(s_max):.2f}])')
-    plt.tight_layout(rect=[0,0,1,0.96])
+        ax.legend()
+        ax.grid(True, alpha=0.4)
+        ax.set_title(TITLES[k])
+        
+    fig.suptitle('Hybrid Model Trajectories (Stable Version)', fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(f'{name}.png')
-
     plt.show()
-
-    def eval_global_loss(y_pred, y_true):
-        y_pred_t = torch.as_tensor(y_pred)
-        return torch.mean((y_pred_t - y_true) ** 2)
-    loss = 0
-    with torch.no_grad():
-        for pid in patient_data:
-            a = F.softplus(ab[pid]['theta'][0]).item() + 1e-4
-            b = ab[pid]['theta'][1]
-            s = a * patient_data[pid]['t'] + b
-            y_pred = model(s, patient_data[pid]['y0'])
-            y_pred = y_pred.numpy()
-            loss += eval_global_loss(y_pred, patient_data[pid]['y'])/len(y_pred)
-        loss /= len(patient_data)
-
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # 追加到输出文件
-    output_filename = f'experiments.out'
-    with open(output_filename, 'a') as f:  # 使用追加模式 'a'
-        f.write(name)
-        f.write(f"Time: {current_time}\n")
-        f.write(Message)
-        f.write("Model structure:\n")
-        f.write(str(model))
-        f.write(f"MSE: {loss:.4f}")
