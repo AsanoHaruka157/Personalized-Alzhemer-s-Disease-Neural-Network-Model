@@ -71,13 +71,22 @@ def load_stage_dict():
             stage_dict[rid] = stage
     return stage_dict
 
-def inv_nor(data, k=None):
+def inv_nor(data, k=None, is_std=False):
     mean_std = np.load('mean_std.npy')
     
     means = mean_std[0]
     stds = mean_std[1]
     
     data = np.asarray(data)
+    
+    # For standard deviation, we only scale by std, don't add mean
+    if is_std:
+        if k is not None:
+            original_data = data.T * stds[k]
+        else:
+            original_data = data * stds
+        return original_data
+
     if k is not None:
         original_data = (data.T * stds[k]) + means[k]
     else:
