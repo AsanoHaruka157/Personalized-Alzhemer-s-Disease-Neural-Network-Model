@@ -52,7 +52,7 @@ class ODEModel(nn.Module):
 
 
 # --- 2. Core Function for Personalization ---
-def personalize_for_patient(pid, population_model, dps_params, patient_data, sensitive_indices, n_iter=10):
+def personalize_for_patient(pid, population_model, dps_params, patient_data, sensitive_indices, epochs=10, n_iter=10):
     """
     Personalizes the model for a single patient using their training data.
     """
@@ -95,29 +95,29 @@ def personalize_for_patient(pid, population_model, dps_params, patient_data, sen
     patient_y0 = patient_data[pid]['y0'] # The initial condition is always the first point
 
     last_loss = torch.tensor(0.0) # Variable to store the loss from closure
+    for i in range(epochs):
+        def closure():
+            nonlocal last_loss
+            optimizer.zero_grad()
+            s_personal_train = personal_dps_a * patient_t_train + personal_dps_b
+            s_sorted, indices = torch.sort(s_personal_train)
+            y_sorted = patient_y_train[indices]
+            
+            # The ODE initial condition must correspond to the first time point in s_sorted.
+            y_pred = personal_model(s_sorted, y_sorted[0])
+            
+            # Check if the solver returned NaNs
+            if torch.isnan(y_pred).any():
+                return torch.tensor(float('inf')) # If solver fails, return infinite loss
 
-    def closure():
-        nonlocal last_loss
+            loss = torch.mean((y_pred - y_sorted)**2)
+            if torch.isfinite(loss):
+                loss.backward()
+            
+            last_loss = loss
+            return loss
         optimizer.zero_grad()
-        s_personal_train = personal_dps_a * patient_t_train + personal_dps_b
-        s_sorted, indices = torch.sort(s_personal_train)
-        y_sorted = patient_y_train[indices]
-        
-        # The ODE initial condition must correspond to the first time point in s_sorted.
-        y_pred = personal_model(s_sorted, y_sorted[0])
-        
-        # Check if the solver returned NaNs
-        if torch.isnan(y_pred).any():
-            return torch.tensor(float('inf')) # If solver fails, return infinite loss
-
-        loss = torch.mean((y_pred - y_sorted)**2)
-        if torch.isfinite(loss):
-            loss.backward()
-        
-        last_loss = loss
-        return loss
-
-    optimizer.step(closure)
+        optimizer.step(closure)
     
     print(f"  Final loss for patient {pid}: {last_loss.item()}")
     personal_model.eval()
@@ -125,6 +125,8 @@ def personalize_for_patient(pid, population_model, dps_params, patient_data, sen
 
 # --- 3. Main Program ---
 if __name__ == '__main__':
+    N_PATIENTS_TO_VISUALIZE = 1
+
     # Set global dtype to float64 for better numerical precision
     torch.set_default_dtype(torch.float64)
 
@@ -159,6 +161,7 @@ if __name__ == '__main__':
         exit()
 
     csf_dict = pc.load_data()
+    stage_dict = pc.load_stage_dict() # Load the stage dictionary
     patient_data = {pid: {"t": torch.from_numpy(sample[:, 0]).double(),
                           "y": torch.from_numpy(sample[:, 1:5]).double(),
                           "y0": torch.from_numpy(sample[:1, 1:5]).double().squeeze(0)}
@@ -167,15 +170,16 @@ if __name__ == '__main__':
     # *** Filter for patients with at least 4 data points for cross-validation ***
     eligible_pids = [pid for pid, data in patient_data.items() if len(data['t']) >= 4]
     
-    if len(eligible_pids) < 4:
-        print(f"Error: Only {len(eligible_pids)} patients have at least 4 data points. Need at least 4 for visualization.")
+    if len(eligible_pids) < N_PATIENTS_TO_VISUALIZE:
+        print(f"Error: Only {len(eligible_pids)} patients have at least 4 data points. Need at least {N_PATIENTS_TO_VISUALIZE} for visualization.")
         exit()
         
-    # Randomly select 4 eligible patients for display
-    selected_pids = random.sample(eligible_pids, 4)
-    print(f"\nRandomly selected 4 patient IDs for visualization: {selected_pids}")
+    # Randomly select N_PATIENTS_TO_VISUALIZE eligible patients for display
+    selected_pids = random.sample(eligible_pids, N_PATIENTS_TO_VISUALIZE)
+    print(f"\nRandomly selected {N_PATIENTS_TO_VISUALIZE} patient ID(s) for visualization: {selected_pids}")
 
-    fig, axes = plt.subplots(4, 4, figsize=(20, 20)) # Removed sharex=True
+    # Create a figure with a dynamic number of rows. squeeze=False ensures axes is always 2D.
+    fig, axes = plt.subplots(N_PATIENTS_TO_VISUALIZE, 4, figsize=(20, 5 * N_PATIENTS_TO_VISUALIZE), squeeze=False)
     TITLES = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
     
     for i, pid in enumerate(selected_pids):
@@ -188,31 +192,22 @@ if __name__ == '__main__':
 
         t_patient = patient_data[pid]['t'].numpy()
         y_patient_orig = pc.inv_nor(patient_data[pid]['y'].numpy())
-        y0_patient = patient_data[pid]['y0']
 
         s_pers = personal_dps['a'] * t_patient + personal_dps['b']
-        s_pers_tensor = torch.from_numpy(s_pers).double()
 
-        # Find the y-value corresponding to the start of the personalized s-grid for the initial condition
+        # --- Define plotting grid based on each patient's data ---
         s_pers_sorted, s_pers_indices = np.sort(s_pers), np.argsort(s_pers)
         y_patient_sorted = patient_data[pid]['y'][s_pers_indices]
         y0_pers = y_patient_sorted[0]
 
-        # *** Core modification: Define grid to start EXACTLY at the first data point ***
         padding = 2.0
-        s_min_plot = s_pers_sorted[0] # Start plotting exactly from the first s-point
-        s_max_plot = s_pers_sorted[-1] + padding # End plotting after the last s-point
-        s_grid_pers = torch.linspace(s_min_plot, s_max_plot, 200).double()
-
-        # For a fair comparison, both trajectories should ideally start from the same point.
-        # We will use the personalized grid and initial condition for both plots.
-        s_grid_plot = s_grid_pers
+        s_min_plot = s_pers_sorted[0]
+        s_max_plot = s_pers_sorted[-1] + padding
+        s_grid_plot = torch.linspace(s_min_plot, s_max_plot, 200).double()
 
         with torch.no_grad():
-            # Generate population model trajectory starting from the same initial point as the personalized one
+            # Generate trajectories from the patient's specific initial condition and grid
             y_pop_pred_norm = population_model(s_grid_plot, y0_pers)
-            
-            # Generate personalized model trajectory starting from the correct (s0, y0)
             y_pers_pred_norm = personal_model(s_grid_plot, y0_pers)
             
             y_pop_pred_orig = pc.inv_nor(y_pop_pred_norm.numpy()) if not torch.isnan(y_pop_pred_norm).any() else np.full((len(s_grid_plot), 4), np.nan)
@@ -243,7 +238,7 @@ if __name__ == '__main__':
             ax.grid(True, linestyle=':', alpha=0.6)
 
     fig.supxlabel('Disease Progression Score (s)', fontsize=16)
-    fig.suptitle('Comparison of Personalized Model Predictions', fontsize=20)
+    fig.suptitle('Personalized Model Prediction', fontsize=20)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig('personalization_results.png')
+    plt.savefig('personalization.png')
     plt.show()
