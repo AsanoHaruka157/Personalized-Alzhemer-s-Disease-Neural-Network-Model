@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from scipy.optimize import curve_fit
 
 # 1. load data
 # read rawdata.xlsx
@@ -130,93 +129,33 @@ df = pd.DataFrame(merged_rows)
 df = df[['RID', 'AGE', 'ABETA', 'TAU', 'N', 'C']]
 df.rename(columns={'RID': 'PID'}, inplace=True)
 
-#4. 使用基于AGE的Sigmoid函数拟合填补缺失值
-# 定义sigmoid函数
-def sigmoid(x, a, b, c, d):
-    """
-    Sigmoid函数: y = a / (1 + exp(-b*(x-c))) + d
-    a: 幅度
-    b: 斜率
-    c: 中心点
-    d: 垂直偏移
-    """
-    return a / (1.0 + np.exp(-b * (x - c))) + d
+#4. 过滤测量次数不足的受试者
+# 对每个PID，检查四个生物标志物的测量次数
+# 如果任意一个标志物的测量次数少于2次，排除该受试者
+print(f"过滤前的受试者数: {df['PID'].nunique()}")
+print(f"过滤前的数据行数: {len(df)}")
 
-# 对每个PID分组，根据AGE进行sigmoid拟合和预测
-interpolated_rows = []
-
+pids_to_keep = []
 for pid, group in df.groupby('PID'):
-    # 按年龄排序
-    group = group.sort_values(by='AGE').reset_index(drop=True)
-    
-    # 对每个生物标记物列进行基于AGE的sigmoid拟合
+    # 计算每个生物标志物的有效测量次数
+    keep = True
     for col in ['ABETA', 'TAU', 'N', 'C']:
-        # 找到该列的有效数据点
-        valid_mask = group[col].notna()
-        valid_ages = group.loc[valid_mask, 'AGE'].values
-        valid_values = group.loc[valid_mask, col].values
-        
-        # 如果至少有4个有效数据点，进行sigmoid拟合
-        if len(valid_ages) >= 4:
-            try:
-                # 设置初始猜测值
-                p0 = [
-                    np.max(valid_values) - np.min(valid_values),  # a: 幅度
-                    0.1,                                            # b: 斜率
-                    np.median(valid_ages),                          # c: 中心点
-                    np.min(valid_values)                            # d: 垂直偏移
-                ]
-                
-                # 使用scipy进行sigmoid拟合
-                params, _ = curve_fit(sigmoid, valid_ages, valid_values, p0=p0, maxfev=5000)
-                
-                # 对所有AGE（包括缺失值）进行预测
-                all_ages = group['AGE'].values
-                predicted_values = sigmoid(all_ages, *params)
-                
-                # 用预测值填充NaN
-                group.loc[group[col].isna(), col] = predicted_values[group[col].isna()]
-                
-            except (RuntimeError, ValueError, TypeError):
-                # 如果sigmoid拟合失败，退回到线性拟合
-                coeffs = np.polyfit(valid_ages, valid_values, deg=1)
-                k, b = coeffs[0], coeffs[1]
-                all_ages = group['AGE'].values
-                predicted_values = k * all_ages + b
-                group.loc[group[col].isna(), col] = predicted_values[group[col].isna()]
-                
-        elif len(valid_ages) == 3:
-            # 如果有3个数据点，使用二次多项式拟合
-            coeffs = np.polyfit(valid_ages, valid_values, deg=2)
-            all_ages = group['AGE'].values
-            predicted_values = np.polyval(coeffs, all_ages)
-            group.loc[group[col].isna(), col] = predicted_values[group[col].isna()]
-            
-        elif len(valid_ages) == 2:
-            # 如果只有2个数据点，使用线性拟合
-            coeffs = np.polyfit(valid_ages, valid_values, deg=1)
-            k, b = coeffs[0], coeffs[1]
-            all_ages = group['AGE'].values
-            predicted_values = k * all_ages + b
-            group.loc[group[col].isna(), col] = predicted_values[group[col].isna()]
-            
-        elif len(valid_ages) == 1:
-            # 如果只有1个数据点，用该值填充所有缺失值（常数外推）
-            group[col].fillna(valid_values[0], inplace=True)
-        # 如果该列完全没有数据，保持NaN
+        valid_count = group[col].notna().sum()
+        if valid_count < 2:
+            keep = False
+            break
     
-    interpolated_rows.append(group)
+    if keep:
+        pids_to_keep.append(pid)
 
-# 合并所有插值后的数据
-df = pd.concat(interpolated_rows, ignore_index=True)
+# 只保留符合条件的受试者
+df = df[df['PID'].isin(pids_to_keep)]
 
-# 删除仍然有NaN的行（某些列完全没有数据的情况）
+print(f"过滤后的受试者数: {df['PID'].nunique()}")
+print(f"过滤后的数据行数: {len(df)}")
+
+# 删除仍然有NaN的行
 df = df.dropna()
-
-# 可选：删除数据点过少的PID（如果需要的话）
-rid_counts = df['PID'].value_counts()
-# to_remove = rid_counts[rid_counts < 2].index  # 可以设置最小数据点数
-# df = df[~df['PID'].isin(to_remove)]
 
 #4.5 删除离群值（保留2.5%到97.5%分位数之间的数据）
 print(f"删除离群值前的数据行数: {len(df)}")
