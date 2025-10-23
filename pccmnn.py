@@ -24,10 +24,10 @@ def load_data():
     for rid in csf_dict:
         csf_dict[rid] = np.array(csf_dict[rid])
 
-    keys_to_delete = [key for key in csf_dict if csf_dict[key].shape[0] == 1]
+    # keys_to_delete = [key for key in csf_dict if csf_dict[key].shape[0] == 1]
 
-    for key in keys_to_delete:
-        del csf_dict[key]
+    # for key in keys_to_delete:
+    #     del csf_dict[key]
 
     return csf_dict
 
@@ -53,10 +53,10 @@ def load_rawdata():
     for rid in csf_dict:
         csf_dict[rid] = np.array(csf_dict[rid])
 
-    keys_to_delete = [key for key in csf_dict if csf_dict[key].shape[0] == 1]
+    # keys_to_delete = [key for key in csf_dict if csf_dict[key].shape[0] == 1]
 
-    for key in keys_to_delete:
-        del csf_dict[key]
+    # for key in keys_to_delete:
+    #     del csf_dict[key]
 
     return csf_dict
 

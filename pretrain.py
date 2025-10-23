@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
@@ -21,9 +23,9 @@ def assign_dps_params(csf_dict, stage_dict):
     patient_data = {}
     # 按照您的要求更新 s_ranges
     s_ranges = {
-        'CN': (-10, 5),
+        'CN': (-5, 5),
         'LMCI': (0, 10),
-        'AD': (5, 20),
+        'AD': (5, 15),
         'Other': (-10, 20) # 为其他类型提供一个默认范围
     }
     a_values = {'CN': 1.0, 'LMCI': 2.0, 'AD': 4.0, 'Other': 1.0}
@@ -106,7 +108,24 @@ def fit_sigmoids(s_data, y_data):
             
     return np.array(sigmoid_params)
 
-# --- 3. 拟合多项式模型以匹配Sigmoid导数 ---
+# --- 3. 定义神经网络模型以匹配Sigmoid导数 ---
+class ODENet(nn.Module):
+    """单隐藏层神经网络用于学习dy/ds"""
+    def __init__(self, input_dim=4, hidden_dim=512, output_dim=4):
+        super(ODENet, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.activation = nn.Tanh()  # 使用Tanh激活函数
+        
+    def forward(self, y):
+        """
+        输入: y (batch_size, 4) - 4个生物标记物的值
+        输出: dy/ds (batch_size, 4) - 4个导数
+        """
+        h = self.activation(self.fc1(y))
+        dyds = self.fc2(h)
+        return dyds
+
 def get_sigmoid_derivatives(s_grid, params):
     """计算sigmoid函数在网格点上的值和解析导数"""
     y_on_grid = np.zeros((len(s_grid), 4))
@@ -120,75 +139,74 @@ def get_sigmoid_derivatives(s_grid, params):
         
     return y_on_grid, dyds_on_grid
 
-def build_feature_matrix(y):
-    """根据y构建多项式模型的特征矩阵 (Phi)"""
-    A, T, N, C = y[:, 0], y[:, 1], y[:, 2], y[:, 3]
+def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4):
+    """训练神经网络来拟合sigmoid导数"""
+    print("正在训练神经网络模型...")
     
-    # 对应论文中的公式(6)
-    # dA/ds = wA0 + wA1*A + wA2*A^2
-    phi_A = np.stack([np.ones_like(A), A, A**2], axis=1)
+    # 转换为PyTorch张量
+    y_tensor = torch.tensor(y_target, dtype=torch.float32)
+    dyds_tensor = torch.tensor(dyds_target, dtype=torch.float32)
     
-    # dT/ds = wT0 + wT1*T + wT2*T^2 + wT3*A + wT4*A^2 + wT5*A*T
-    phi_T = np.stack([np.ones_like(T), T, T**2, A, A**2, A*T], axis=1)
-
-    # dN/ds = wN0 + wN1*N + wN2*N^2 + wN3*T + wN4*T^2 + wN5*T*N
-    phi_N = np.stack([np.ones_like(N), N, N**2, T, T**2, T*N], axis=1)
-
-    # dC/ds = wC0 + wC1*C + wC2*C^2 + wC3*N + wC4*N^2 + wC5*N*C
-    phi_C = np.stack([np.ones_like(C), C, C**2, N, N**2, N*C], axis=1)
+    # 创建模型
+    model = ODENet(input_dim=4, hidden_dim=256, output_dim=4)
     
-    return [phi_A, phi_T, phi_N, phi_C]
-
-
-def fit_polynomial_model(y_target, dyds_target):
-    """使用最小二乘法求解多项式系数"""
-    phi_list = build_feature_matrix(y_target)
-    poly_coeffs = []
-    print("正在求解多项式模型的系数...")
-    for k in range(4):
-        phi = phi_list[k]
-        dyds = dyds_target[:, k]
-        # 使用最小二乘法求解: w = (phi^T * phi)^-1 * phi^T * dyds
-        coeffs, _, _, _ = np.linalg.lstsq(phi, dyds, rcond=None)
-        poly_coeffs.append(coeffs)
-        print(f"  - 方程 {k+1} 系数求解完毕。")
-    return poly_coeffs
+    # 定义损失函数和优化器
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # 训练循环
+    model.train()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        
+        # 前向传播
+        dyds_pred = model(y_tensor)
+        
+        # 计算损失
+        loss = criterion(dyds_pred, dyds_tensor)
+        
+        # 反向传播和优化
+        loss.backward()
+        optimizer.step()
+        
+        # 打印进度
+        if (epoch + 1) % 500 == 0:
+            print(f"  Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}")
+    
+    print("神经网络训练完成！")
+    model.eval()
+    return model
 
 # --- 4. 绘图与ODE求解 ---
-def ode_system(y, s, coeffs):
-    """定义多项式ODE系统，供求解器使用"""
-    A, T, N, C = y
+def ode_system(y, s, model):
+    """定义神经网络ODE系统，供求解器使用"""
+    # 将numpy数组转换为tensor
+    y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(0)  # (1, 4)
     
-    # 提取系数
-    wA, wT, wN, wC = coeffs
+    # 使用神经网络预测导数
+    with torch.no_grad():
+        dyds_tensor = model(y_tensor)
     
-    # 构建特征向量
-    phi_A_vec = np.array([1, A, A**2])
-    phi_T_vec = np.array([1, T, T**2, A, A**2, A*T])
-    phi_N_vec = np.array([1, N, N**2, T, T**2, T*N])
-    phi_C_vec = np.array([1, C, C**2, N, N**2, N*C])
+    # 转换回numpy数组
+    dyds = dyds_tensor.squeeze(0).numpy()
     
-    # 计算导数
-    dAds = np.dot(wA, phi_A_vec)
-    dTds = np.dot(wT, phi_T_vec)
-    dNds = np.dot(wN, phi_N_vec)
-    dCds = np.dot(wC, phi_C_vec)
-    
-    return [dAds, dTds, dNds, dCds]
+    return dyds
 
-def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, poly_coeffs, y0_norm):
+def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, model, y0_norm):
     """绘制最终结果图"""
     print("正在生成最终结果图...")
     # 反归一化，准备绘图
     y_pop_orig = pc.inv_nor(y_pop)
 
-    # 计算Sigmoid和多项式轨迹
+    # 计算Sigmoid函数值（直接计算）
     y_sigmoid_grid_norm, _ = get_sigmoid_derivatives(s_grid, sigmoid_params)
     y_sigmoid_grid_orig = pc.inv_nor(y_sigmoid_grid_norm)
     
-    # 使用传入的 y0_norm 作为初始值
-    y_poly_traj_norm = odeint(ode_system, y0_norm, s_grid, args=(poly_coeffs,))
-    y_poly_traj_orig = pc.inv_nor(y_poly_traj_norm)
+    # 神经网络轨迹：从sigmoid在起点的值开始积分（使用相同的初值）
+    y0_sigmoid = y_sigmoid_grid_norm[0]  # sigmoid在s_grid起点的值
+    print(f"使用相同的初始值 (归一化): {y0_sigmoid}")
+    y_nn_traj_norm = odeint(ode_system, y0_sigmoid, s_grid, args=(model,))
+    y_nn_traj_orig = pc.inv_nor(y_nn_traj_norm)
 
     TITLES = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
     colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
@@ -211,19 +229,23 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, poly_coeffs, 
             s_vals, y_vals = scatter_data[stage]
             ax.scatter(s_vals, y_vals[:, k], s=15, alpha=0.5, c=colors[stage], label=stage)
 
-        # 绘制Sigmoid轨迹
+        # 绘制Sigmoid拟合曲线
         ax.plot(s_grid, y_sigmoid_grid_orig[:, k], 'r-', lw=2.5, label='Sigmoid Fit', zorder=3)
         
-        # 绘制多项式ODE轨迹
-        ax.plot(s_grid, y_poly_traj_orig[:, k], 'k--', lw=2.5, label='Polynomial ODE', zorder=3)
+        # 绘制神经网络ODE轨迹（从相同初始值开始）
+        ax.plot(s_grid, y_nn_traj_orig[:, k], 'k--', lw=2.5, label='Neural Network ODE', zorder=3)
 
         ax.set_xlabel('Disease Progression Score (s)')
         ax.set_ylabel(TITLES[k])
+        
+        # 设置横轴范围与s_grid一致
+        ax.set_xlim(s_grid.min(), s_grid.max())
+        
         ax.legend()
         ax.grid(True, alpha=0.4)
         ax.set_title(f'Trajectory for {TITLES[k]}')
 
-    fig.suptitle('AD Biomarker Trajectories: Sigmoid vs. Polynomial ODE Model', fontsize=16)
+    fig.suptitle('AD Biomarker Trajectories: Sigmoid Fit vs. Neural Network ODE', fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig('pretrain.png')
     plt.show()
@@ -240,24 +262,23 @@ if __name__ == '__main__':
     # 2. 拟合Sigmoid函数
     sigmoid_params = fit_sigmoids(s_pop, y_pop_norm)
 
-    # 3. 拟合多项式模型
-    s_grid = np.linspace(-10, 20, 300)
+    # 3. 训练神经网络模型
+    # 根据实际数据范围动态设置s_grid，并稍微扩展范围
+    s_min, s_max = s_pop.min(), s_pop.max()
+    s_margin = (s_max - s_min) * 0.1  # 扩展10%的边距
+    s_grid = np.linspace(s_min - s_margin, s_max + s_margin, 300)
+    print(f"s_grid范围: [{s_grid.min():.2f}, {s_grid.max():.2f}]")
+    
     y_sigmoid_grid_norm, dyds_sigmoid_grid_norm = get_sigmoid_derivatives(s_grid, sigmoid_params)
-    poly_coeffs = fit_polynomial_model(y_sigmoid_grid_norm, dyds_sigmoid_grid_norm)
+    nn_model = train_neural_network(y_sigmoid_grid_norm, dyds_sigmoid_grid_norm)
     
     # 4. 求解ODE并绘图
-    plot_results(s_pop, y_pop_norm, stages_pop, s_grid, sigmoid_params, poly_coeffs, y0_cn_avg_norm)
+    plot_results(s_pop, y_pop_norm, stages_pop, s_grid, sigmoid_params, nn_model, y0_cn_avg_norm)
     
     # 5. 保存模型参数
-    # 保存多项式模型系数
-    poly_coeffs_dict = {
-        'wA': torch.tensor(poly_coeffs[0], dtype=torch.float32),
-        'wT': torch.tensor(poly_coeffs[1], dtype=torch.float32),
-        'wN': torch.tensor(poly_coeffs[2], dtype=torch.float32),
-        'wC': torch.tensor(poly_coeffs[3], dtype=torch.float32),
-    }
-    torch.save(poly_coeffs_dict, 'poly.pth')
-    print("多项式模型系数已保存到 poly.pth")
+    # 保存神经网络模型
+    torch.save(nn_model.state_dict(), 'fnn.pth')
+    print("神经网络模型已保存到 fnn.pth")
 
     # 保存DPS参数
     dps_params_dict = {}
