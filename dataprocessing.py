@@ -153,23 +153,7 @@ df = df[df['PID'].isin(pids_to_keep)]
 
 print(f"过滤后的受试者数: {df['PID'].nunique()}")
 print(f"过滤后的数据行数: {len(df)}")
-
-# 删除仍然有NaN的行
-df = df.dropna()
-
-#4.5 删除离群值（保留2.5%到97.5%分位数之间的数据）
-print(f"删除离群值前的数据行数: {len(df)}")
-
-# 对每个生物标记物列计算分位数
-for col in ['ABETA', 'TAU', 'N', 'C']:
-    q_low = df[col].quantile(0.05)   # 2.5%分位数
-    q_high = df[col].quantile(0.95)  # 97.5%分位数
-    
-    # 删除该列超出范围的行
-    df = df[(df[col] >= q_low) & (df[col] <= q_high)]
-    print(f"  {col}: [{q_low:.4f}, {q_high:.4f}]")
-
-print(f"删除离群值后的数据行数: {len(df)}")
+print(f"NaN数量: {df[['ABETA', 'TAU', 'N', 'C']].isna().sum().sum()}")
 
 name = df[['PID','AGE']]
 df = df[['ABETA', 'TAU', 'N', 'C']]

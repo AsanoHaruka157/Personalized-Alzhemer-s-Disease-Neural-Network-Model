@@ -29,8 +29,23 @@ def get_cn_average_y0(patient_data, stage_dict):
     if not cn_y0s:
         print("警告: 未找到CN患者, 使用預設y0。")
         return torch.tensor([0.1, 0, 0, 0])
-    avg_y0 = torch.stack(cn_y0s).mean(dim=0)
-    print(f"使用CN群體的平均初始值: {avg_y0.numpy()}")
+    
+    # 将所有CN患者的y0堆叠成矩阵
+    cn_y0s_tensor = torch.stack(cn_y0s)  # shape: (num_cn_patients, 4)
+    
+    # 对每个生物标志物分别计算非NaN值的平均
+    avg_y0 = torch.zeros(4)
+    for k in range(4):
+        y0_k = cn_y0s_tensor[:, k]
+        valid_mask = ~torch.isnan(y0_k)
+        if valid_mask.sum() > 0:
+            avg_y0[k] = y0_k[valid_mask].mean()
+        else:
+            # 如果所有CN患者在该标志物上都是NaN，使用0
+            avg_y0[k] = 0.0
+            print(f"警告: 所有CN患者在生物标志物{k}上的初始值都是NaN，使用0。")
+    
+    print(f"使用CN群體的平均初始值（非NaN）: {avg_y0.numpy()}")
     return avg_y0
 
 y0_cn_avg = get_cn_average_y0(patient_data, stage_dict)
@@ -39,7 +54,7 @@ name = 'fnn'
 # --- 1. 定義FNN模型（從pretrain.py復制ODENet結構）---
 class ODENet(nn.Module):
     """单隐藏层神经网络用于学习dy/ds"""
-    def __init__(self, input_dim=4, hidden_dim=256, output_dim=4):
+    def __init__(self, input_dim=4, hidden_dim=38, output_dim=4):
         super(ODENet, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
@@ -65,25 +80,105 @@ class ODEModel(nn.Module):
         return self.fnn(y)
 
 # --- 2. 定義訓練流程 ---
-def calculate_loss(ode_model, patient_data, ab, pids, y0):
-    """计算ODE模型在数据点上的损失"""
-    all_s, all_y = [], []
-    for pid in pids:
-        dat = patient_data[pid]
-        s_values = ab[pid]['a'] * dat['t'] + ab[pid]['b']
-        all_s.append(s_values)
-        all_y.append(dat['y'])
-    
-    s_global, y_global = torch.cat(all_s), torch.cat(all_y)
-    s_sorted, sort_indices = torch.sort(s_global)
-    y_sorted = y_global[sort_indices]
-    
+# ===== 优化后的 FNN 损失 =====
+def calculate_loss_fnn(ode_model, patient_data, ab, pids, y0):
+    """
+    高效版 FNN loss：
+    - 所有病人、所有 biomarker 的 s 值一次合并；
+    - 去重、排序，确保 torchdiffeq 时间轴严格递增；
+    - 在去重时间轴上解一次 ODE，再映射回原索引。
+    """
     try:
-        y_pred = torch_odeint(ode_model, y0, s_sorted, method='dopri5', rtol=1e-4, atol=1e-5)
-        loss = ((y_pred - y_sorted) ** 2).mean()
-        return loss if torch.isfinite(loss) else torch.tensor(float('inf'))
-    except Exception:
-        return torch.tensor(float('inf'))
+        s_all_list, y_true_list, k_list = [], [], []
+        for k in range(4):
+            for pid in pids:
+                dat = patient_data[pid]
+                s_values = ab[pid]['a'] * dat['t'] + ab[pid]['b']
+                y_values = dat['y'][:, k]
+                valid_mask = ~torch.isnan(y_values)
+                if valid_mask.any():
+                    s_all_list.append(s_values[valid_mask])
+                    y_true_list.append(y_values[valid_mask])
+                    k_list.extend([k] * valid_mask.sum().item())
+
+        if not s_all_list:
+            return torch.tensor(0.0, requires_grad=True)
+
+        s_all = torch.cat(s_all_list)
+        y_true_all = torch.cat(y_true_list)
+        k_all = torch.tensor(k_list, device=y_true_all.device, dtype=torch.long)
+
+        # 排序和去重操作不进计算图
+        with torch.no_grad():
+            s_sorted, sort_idx = torch.sort(s_all)
+            y_sorted = y_true_all[sort_idx]
+            k_sorted = k_all[sort_idx]
+            s_unique, inv = torch.unique_consecutive(s_sorted, return_inverse=True)
+
+        # 一次 ODE 求解
+        y_unique = torch_odeint(
+            ode_model, y0, s_unique, method='dopri5', rtol=1e-4, atol=1e-5
+        )  # (Nu, 4)
+
+        # 映射回原索引
+        y_all = y_unique[inv]  # (N, 4)
+        y_pred_selected = y_all[torch.arange(y_all.size(0)), k_sorted]
+
+        loss = ((y_pred_selected - y_sorted) ** 2).sum()
+        return loss if torch.isfinite(loss) else torch.tensor(float('inf'), requires_grad=True)
+
+    except Exception as e:
+        print(f"FNN loss 计算出错: {e}")
+        return torch.tensor(float('inf'), requires_grad=True)
+
+
+# ===== 优化后的 DPS 损失 =====
+def calculate_loss_dps(ode_model, patient_data, ab, pids, y0):
+    """
+    高效版 DPS loss：
+    - 所有病人、所有时间点与 biomarker 合并；
+    - 去重、排序，确保 torchdiffeq 时间轴严格递增；
+    - 在去重时间轴上解一次 ODE，再映射回原索引。
+    """
+    try:
+        s_all_list, y_true_list, k_list = [], [], []
+        for pid in pids:
+            dat = patient_data[pid]
+            s_values = ab[pid]['a'] * dat['t'] + ab[pid]['b']
+            y_true = dat['y']
+            for i in range(y_true.shape[0]):
+                for k in range(4):
+                    if not torch.isnan(y_true[i, k]):
+                        s_all_list.append(s_values[i])
+                        y_true_list.append(y_true[i, k])
+                        k_list.append(k)
+
+        if not s_all_list:
+            return torch.tensor(0.0, requires_grad=True)
+
+        s_all = torch.stack(s_all_list)
+        y_true_all = torch.stack(y_true_list)
+        k_all = torch.tensor(k_list, device=y_true_all.device, dtype=torch.long)
+
+        with torch.no_grad():
+            s_sorted, sort_idx = torch.sort(s_all)
+            y_sorted = y_true_all[sort_idx]
+            k_sorted = k_all[sort_idx]
+            s_unique, inv = torch.unique_consecutive(s_sorted, return_inverse=True)
+
+        y_unique = torch_odeint(
+            ode_model, y0, s_unique, method='dopri5', rtol=1e-4, atol=1e-5
+        )
+
+        y_all = y_unique[inv]
+        y_pred_selected = y_all[torch.arange(y_all.size(0)), k_sorted]
+
+        loss = ((y_pred_selected - y_sorted) ** 2).sum()
+        return loss if torch.isfinite(loss) else torch.tensor(float('inf'), requires_grad=True)
+
+    except Exception as e:
+        print(f"DPS loss 计算出错: {e}")
+        return torch.tensor(float('inf'), requires_grad=True)
 
 def train_alternating(
     fnn_pretrained,
@@ -140,20 +235,20 @@ def train_alternating(
     )
     
     for epoch in range(n_epochs):
-        # --- 步骤 1: 用LBFGS优化FNN ---
+        # --- 步骤 1: 用LBFGS优化FNN（按算法1步骤3-4，对每个biomarker分别算loss）---
         def closure_fnn():
             opt_fnn.zero_grad()
-            loss = calculate_loss(ode_model, patient_data, ab, patient_pids, y0)
+            loss = calculate_loss_fnn(ode_model, patient_data, ab, patient_pids, y0)
             if torch.isfinite(loss):
                 loss.backward()
             return loss
         
         loss_fnn = opt_fnn.step(closure_fnn)
         
-        # --- 步骤 2: 用LBFGS优化a,b参数 ---
+        # --- 步骤 2: 用LBFGS优化a,b参数（按算法1步骤8，对每个patient所有时间点算loss）---
         def closure_dps():
             opt_dps.zero_grad()
-            loss = calculate_loss(ode_model, patient_data, ab, patient_pids, y0)
+            loss = calculate_loss_dps(ode_model, patient_data, ab, patient_pids, y0)
             if torch.isfinite(loss):
                 loss.backward()
             return loss
@@ -172,7 +267,7 @@ def train_alternating(
 if __name__ == '__main__':
     # 加载预训练的FNN模型
     print("\n--- 加载预训练的FNN模型 ---")
-    fnn_pretrained = ODENet(input_dim=4, hidden_dim=256, output_dim=4)
+    fnn_pretrained = ODENet(input_dim=4, hidden_dim=38, output_dim=4)
     try:
         state_dict = torch.load('fnn.pth', weights_only=True)
         

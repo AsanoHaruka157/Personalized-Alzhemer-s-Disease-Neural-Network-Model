@@ -65,7 +65,7 @@ def assign_dps_params(csf_dict, stage_dict):
 # --- 新增功能：计算CN群体的平均初始值 ---
 def get_cn_average_y0(patient_data):
     """
-    计算CN（认知正常）群体在第一次访问时的平均生物标记物值。
+    计算CN（认知正常）群体在第一次访问时的平均生物标记物值（忽略NaN）。
     """
     cn_y0s = []
     for pid, data in patient_data.items():
@@ -75,9 +75,15 @@ def get_cn_average_y0(patient_data):
     if not cn_y0s:
         print("警告：未找到CN患者数据，将使用默认初始值 [0.1, 0, 0, 0]。")
         return np.array([0.1, 0.0, 0.0, 0.0])
-        
-    avg_y0 = np.mean(cn_y0s, axis=0)
-    print(f"计算出的CN群体平均初始值 (归一化后): {avg_y0}")
+    
+    # 使用nanmean对每个生物标志物分别计算非NaN值的平均
+    cn_y0s_array = np.array(cn_y0s)  # shape: (num_cn_patients, 4)
+    avg_y0 = np.nanmean(cn_y0s_array, axis=0)
+    
+    # 如果某个标志物全是NaN，用0填充
+    avg_y0 = np.nan_to_num(avg_y0, nan=0.0)
+    
+    print(f"计算出的CN群体平均初始值（非NaN，归一化后）: {avg_y0}")
     return avg_y0
 
 # --- 2. 用Sigmoid函数拟合人群散点 ---
@@ -86,24 +92,32 @@ def sigmoid(s, a, b, c, d):
     return a / (1.0 + np.exp(-b * (s - c))) + d
 
 def fit_sigmoids(s_data, y_data):
-    """为4个biomarker分别拟合sigmoid函数"""
+    """为4个biomarker分别拟合sigmoid函数（自动处理NaN）"""
     sigmoid_params = []
     print("正在为4个生物标记物拟合Sigmoid曲线...")
     for k in range(4):
         y_k = y_data[:, k]
+        
+        # 去掉NaN值
+        valid_mask = ~np.isnan(y_k)
+        s_k_valid = s_data[valid_mask]
+        y_k_valid = y_k[valid_mask]
+        
+        print(f"  - Biomarker {k+1}: {len(y_k_valid)}/{len(y_k)} 个有效数据点")
+        
         # 为curve_fit提供一个较好的初始猜测值
         p0 = [
-            np.max(y_k) - np.min(y_k),  # a: 幅度
-            0.1,                        # b: 斜率
-            np.median(s_data),          # c: 中心点
-            np.min(y_k)                 # d: 垂直偏移
+            np.max(y_k_valid) - np.min(y_k_valid),  # a: 幅度
+            0.1,                                     # b: 斜率
+            np.median(s_k_valid),                    # c: 中心点
+            np.min(y_k_valid)                        # d: 垂直偏移
         ]
         try:
-            params, _ = curve_fit(sigmoid, s_data, y_k, p0=p0, maxfev=10000)
+            params, _ = curve_fit(sigmoid, s_k_valid, y_k_valid, p0=p0, maxfev=10000)
             sigmoid_params.append(params)
-            print(f"  - Biomarker {k+1} 拟合成功。")
+            print(f"    拟合成功。")
         except RuntimeError:
-            print(f"  - Biomarker {k+1} 拟合失败，将使用初始值。")
+            print(f"    拟合失败，将使用初始值。")
             sigmoid_params.append(p0)
             
     return np.array(sigmoid_params)
@@ -111,7 +125,7 @@ def fit_sigmoids(s_data, y_data):
 # --- 3. 定义神经网络模型以匹配Sigmoid导数 ---
 class ODENet(nn.Module):
     """单隐藏层神经网络用于学习dy/ds"""
-    def __init__(self, input_dim=4, hidden_dim=512, output_dim=4):
+    def __init__(self, input_dim=4, hidden_dim=38, output_dim=4):
         super(ODENet, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
@@ -139,16 +153,17 @@ def get_sigmoid_derivatives(s_grid, params):
         
     return y_on_grid, dyds_on_grid
 
-def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4):
-    """训练神经网络来拟合sigmoid导数"""
-    print("正在训练神经网络模型...")
+def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4, l1_lambda=1e-5):
+    """训练神经网络来拟合sigmoid导数，使用Lasso稀疏化（L1正则化）"""
+    print("正在训练神经网络模型（带L1稀疏化）...")
+    print(f"L1正则化系数: {l1_lambda}")
     
     # 转换为PyTorch张量
     y_tensor = torch.tensor(y_target, dtype=torch.float32)
     dyds_tensor = torch.tensor(dyds_target, dtype=torch.float32)
     
     # 创建模型
-    model = ODENet(input_dim=4, hidden_dim=256, output_dim=4)
+    model = ODENet(input_dim=4, hidden_dim=38, output_dim=4)
     
     # 定义损失函数和优化器
     criterion = nn.MSELoss()
@@ -162,16 +177,24 @@ def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4):
         # 前向传播
         dyds_pred = model(y_tensor)
         
-        # 计算损失
-        loss = criterion(dyds_pred, dyds_tensor)
+        # 计算MSE损失
+        mse_loss = criterion(dyds_pred, dyds_tensor)
+        
+        # 添加L1正则化（Lasso稀疏化）
+        l1_penalty = 0.0
+        for param in model.parameters():
+            l1_penalty += torch.sum(torch.abs(param))
+        
+        # 总损失 = MSE损失 + L1惩罚
+        total_loss = mse_loss + l1_lambda * l1_penalty
         
         # 反向传播和优化
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
         
         # 打印进度
         if (epoch + 1) % 500 == 0:
-            print(f"  Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.6f}")
+            print(f"  Epoch [{epoch+1}/{epochs}], MSE Loss: {mse_loss.item():.6f}, L1 Penalty: {l1_penalty.item():.6f}, Total: {total_loss.item():.6f}")
     
     print("神经网络训练完成！")
     model.eval()
@@ -251,6 +274,101 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, model, y0_nor
     plt.show()
 
 
+def plot_parameter_distribution(model):
+    """绘制神经网络参数分布的直方图"""
+    print("\n正在生成神经网络参数分布图...")
+    
+    # 收集所有参数值
+    all_params = []
+    param_counts = {}
+    
+    for name, param in model.named_parameters():
+        param_values = param.data.cpu().numpy().flatten()
+        all_params.extend(param_values)
+        param_counts[name] = len(param_values)
+    
+    all_params = np.array(all_params)
+    
+    # 统计信息
+    print(f"\n神经网络参数统计:")
+    print(f"  总参数数量: {len(all_params)}")
+    print(f"  均值: {all_params.mean():.6f}")
+    print(f"  标准差: {all_params.std():.6f}")
+    print(f"  最小值: {all_params.min():.6f}")
+    print(f"  最大值: {all_params.max():.6f}")
+    
+    # 统计接近0的参数（稀疏性指标）
+    threshold = 1e-3
+    near_zero = np.abs(all_params) < threshold
+    sparsity = near_zero.sum() / len(all_params) * 100
+    print(f"  接近0的参数比例 (|w| < {threshold}): {sparsity:.2f}%")
+    
+    # 创建图形
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # 子图1: 所有参数的直方图
+    ax1 = axes[0, 0]
+    ax1.hist(all_params, bins=100, alpha=0.7, color='blue', edgecolor='black')
+    ax1.set_xlabel('Parameter Value')
+    ax1.set_ylabel('Frequency')
+    ax1.set_title('All Parameters Distribution')
+    ax1.grid(True, alpha=0.3)
+    ax1.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
+    ax1.legend()
+    
+    # 子图2: 参数绝对值的直方图（对数刻度）
+    ax2 = axes[0, 1]
+    abs_params = np.abs(all_params)
+    ax2.hist(abs_params, bins=100, alpha=0.7, color='green', edgecolor='black')
+    ax2.set_xlabel('|Parameter Value|')
+    ax2.set_ylabel('Frequency')
+    ax2.set_title('Absolute Parameter Values (Log Scale)')
+    ax2.set_yscale('log')
+    ax2.grid(True, alpha=0.3)
+    
+    # 子图3: 各层参数的箱线图
+    ax3 = axes[1, 0]
+    layer_params = []
+    layer_names = []
+    for name, param in model.named_parameters():
+        layer_params.append(param.data.cpu().numpy().flatten())
+        layer_names.append(name)
+    
+    bp = ax3.boxplot(layer_params, labels=layer_names, patch_artist=True)
+    for patch in bp['boxes']:
+        patch.set_facecolor('lightblue')
+    ax3.set_ylabel('Parameter Value')
+    ax3.set_title('Parameter Distribution by Layer')
+    ax3.grid(True, alpha=0.3)
+    ax3.tick_params(axis='x', rotation=45)
+    
+    # 子图4: 稀疏性统计（各层）
+    ax4 = axes[1, 1]
+    layer_sparsity = []
+    for param_vals in layer_params:
+        layer_near_zero = np.abs(param_vals) < threshold
+        layer_sparsity.append(layer_near_zero.sum() / len(param_vals) * 100)
+    
+    bars = ax4.bar(range(len(layer_names)), layer_sparsity, color='orange', alpha=0.7, edgecolor='black')
+    ax4.set_xlabel('Layer')
+    ax4.set_ylabel(f'Sparsity (% with |w| < {threshold})')
+    ax4.set_title('Sparsity by Layer')
+    ax4.set_xticks(range(len(layer_names)))
+    ax4.set_xticklabels(layer_names, rotation=45, ha='right')
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # 在柱状图上显示数值
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        ax4.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig('parameter_distribution.png')
+    print("参数分布图已保存到 parameter_distribution.png")
+    plt.show()
+
+
 if __name__ == '__main__':
     # --- 执行Pipeline ---
     # 1. 分配DPS参数并获取人群数据点
@@ -286,5 +404,8 @@ if __name__ == '__main__':
         dps_params_dict[pid] = {'a': data['a'], 'b': data['b']}
     torch.save(dps_params_dict, 'dps.pth')
     print("DPS参数已保存到 dps.pth")
+    
+    # 6. 绘制神经网络参数分布图
+    plot_parameter_distribution(nn_model)
     
     print("\n流程执行完毕。")
