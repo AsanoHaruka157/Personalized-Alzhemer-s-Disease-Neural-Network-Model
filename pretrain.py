@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.integrate import odeint
+from tqdm import tqdm
 import pccmnn as pc # 假设您有这个文件来加载和反归一化数据
 
 # --- 0. 数据加载和准备 ---
@@ -23,9 +24,9 @@ def assign_dps_params(csf_dict, stage_dict):
     patient_data = {}
     # 按照您的要求更新 s_ranges
     s_ranges = {
-        'CN': (-5, 5),
-        'LMCI': (0, 10),
-        'AD': (5, 15),
+        'CN': (-10, 0),
+        'LMCI': (-2, 8),
+        'AD': (5, 20),
         'Other': (-10, 20) # 为其他类型提供一个默认范围
     }
     a_values = {'CN': 1.0, 'LMCI': 2.0, 'AD': 4.0, 'Other': 1.0}
@@ -108,7 +109,7 @@ def fit_sigmoids(s_data, y_data):
         # 为curve_fit提供一个较好的初始猜测值
         p0 = [
             np.max(y_k_valid) - np.min(y_k_valid),  # a: 幅度
-            0.1,                                     # b: 斜率
+            10,                                     # b: 斜率
             np.median(s_k_valid),                    # c: 中心点
             np.min(y_k_valid)                        # d: 垂直偏移
         ]
@@ -122,14 +123,14 @@ def fit_sigmoids(s_data, y_data):
             
     return np.array(sigmoid_params)
 
-# --- 3. 定义神经网络模型以匹配Sigmoid导数 ---
+# --- 3. 定义神经网络模型 ---
 class ODENet(nn.Module):
     """单隐藏层神经网络用于学习dy/ds"""
-    def __init__(self, input_dim=4, hidden_dim=38, output_dim=4):
+    def __init__(self, input_dim=4, hidden_dim=4, output_dim=4):
         super(ODENet, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.activation = nn.Tanh()  # 使用Tanh激活函数
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+        self.activation = nn.Tanh()
         
     def forward(self, y):
         """
@@ -137,8 +138,20 @@ class ODENet(nn.Module):
         输出: dy/ds (batch_size, 4) - 4个导数
         """
         h = self.activation(self.fc1(y))
-        dyds = self.fc2(h)
+        dyds = self.activation(self.fc3(h))
         return dyds
+
+
+class ODEModel(nn.Module):
+    """ODE模型包装器，用于torchdiffeq"""
+    def __init__(self, fnn_model):
+        super().__init__()
+        self.fnn = fnn_model
+        
+    def forward(self, t, y):
+        """torchdiffeq的函数签名是 func(t, y)"""
+        return self.fnn(y)
+
 
 def get_sigmoid_derivatives(s_grid, params):
     """计算sigmoid函数在网格点上的值和解析导数"""
@@ -153,7 +166,7 @@ def get_sigmoid_derivatives(s_grid, params):
         
     return y_on_grid, dyds_on_grid
 
-def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4, l1_lambda=1e-5):
+def train_neural_network(y_target, dyds_target, epochs=20000, lr=1e-4, l1_lambda=1e-5):
     """训练神经网络来拟合sigmoid导数，使用Lasso稀疏化（L1正则化）"""
     print("正在训练神经网络模型（带L1稀疏化）...")
     print(f"L1正则化系数: {l1_lambda}")
@@ -163,7 +176,7 @@ def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4, l1_lambda
     dyds_tensor = torch.tensor(dyds_target, dtype=torch.float32)
     
     # 创建模型
-    model = ODENet(input_dim=4, hidden_dim=38, output_dim=4)
+    model = ODENet()
     
     # 定义损失函数和优化器
     criterion = nn.MSELoss()
@@ -171,7 +184,9 @@ def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4, l1_lambda
     
     # 训练循环
     model.train()
-    for epoch in range(epochs):
+    progress_bar = tqdm(range(epochs), desc="预训练神经网络", ncols=120)
+    
+    for epoch in progress_bar:
         optimizer.zero_grad()
         
         # 前向传播
@@ -192,9 +207,12 @@ def train_neural_network(y_target, dyds_target, epochs=10000, lr=1e-4, l1_lambda
         total_loss.backward()
         optimizer.step()
         
-        # 打印进度
-        if (epoch + 1) % 500 == 0:
-            print(f"  Epoch [{epoch+1}/{epochs}], MSE Loss: {mse_loss.item():.6f}, L1 Penalty: {l1_penalty.item():.6f}, Total: {total_loss.item():.6f}")
+        # 更新进度条
+        progress_bar.set_postfix({
+            'MSE': f'{mse_loss.item():.6f}',
+            'L1': f'{l1_penalty.item():.6f}',
+            'Total': f'{total_loss.item():.6f}'
+        })
     
     print("神经网络训练完成！")
     model.eval()
@@ -256,7 +274,7 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, model, y0_nor
         ax.plot(s_grid, y_sigmoid_grid_orig[:, k], 'r-', lw=2.5, label='Sigmoid Fit', zorder=3)
         
         # 绘制神经网络ODE轨迹（从相同初始值开始）
-        ax.plot(s_grid, y_nn_traj_orig[:, k], 'k--', lw=2.5, label='Neural Network ODE', zorder=3)
+        ax.plot(s_grid, y_nn_traj_orig[:, k], 'k--', lw=2.5, label='Neural ODE', zorder=3)
 
         ax.set_xlabel('Disease Progression Score (s)')
         ax.set_ylabel(TITLES[k])
@@ -268,7 +286,7 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, model, y0_nor
         ax.grid(True, alpha=0.4)
         ax.set_title(f'Trajectory for {TITLES[k]}')
 
-    fig.suptitle('AD Biomarker Trajectories: Sigmoid Fit vs. Neural Network ODE', fontsize=16)
+    fig.suptitle('AD Biomarker Trajectories: Sigmoid Fit vs. Neural ODE', fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig('pretrain.png')
     plt.show()
@@ -395,15 +413,15 @@ if __name__ == '__main__':
     
     # 5. 保存模型参数
     # 保存神经网络模型
-    torch.save(nn_model.state_dict(), 'fnn.pth')
-    print("神经网络模型已保存到 fnn.pth")
+    torch.save(nn_model.state_dict(), 'fnn_pretrain.pth')
+    print("神经网络模型已保存到 fnn_pretrain.pth")
 
     # 保存DPS参数
     dps_params_dict = {}
     for pid, data in patient_data.items():
         dps_params_dict[pid] = {'a': data['a'], 'b': data['b']}
-    torch.save(dps_params_dict, 'dps.pth')
-    print("DPS参数已保存到 dps.pth")
+    torch.save(dps_params_dict, 'dps_pretrain.pth')
+    print("DPS参数已保存到 dps_pretrain.pth")
     
     # 6. 绘制神经网络参数分布图
     plot_parameter_distribution(nn_model)

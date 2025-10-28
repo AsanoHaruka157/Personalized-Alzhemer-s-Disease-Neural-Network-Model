@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pccmnn as pc
-try:
-    from torchdiffeq import odeint as torch_odeint
-except ImportError:
-    raise ImportError("Please install torchdiffeq to run this script: pip install torchdiffeq")
+from tqdm import tqdm
+from pretrain import ODENet, ODEModel  # 从pretrain.py导入模型定义
+from torchdiffeq import odeint as torch_odeint
 
 # --- 0. 資料載入和準備 ---
 csf_dict = pc.load_data()
@@ -51,35 +51,7 @@ def get_cn_average_y0(patient_data, stage_dict):
 y0_cn_avg = get_cn_average_y0(patient_data, stage_dict)
 name = 'fnn'
 
-# --- 1. 定義FNN模型（從pretrain.py復制ODENet結構）---
-class ODENet(nn.Module):
-    """单隐藏层神经网络用于学习dy/ds"""
-    def __init__(self, input_dim=4, hidden_dim=38, output_dim=4):
-        super(ODENet, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.activation = nn.Tanh()  # 使用Tanh激活函数
-        
-    def forward(self, y):
-        """
-        输入: y (batch_size, 4) - 4个生物标记物的值
-        输出: dy/ds (batch_size, 4) - 4个导数
-        """
-        h = self.activation(self.fc1(y))
-        dyds = self.fc2(h)
-        return dyds
-
-class ODEModel(nn.Module):
-    """ODE模型包装器"""
-    def __init__(self, fnn_model):
-        super().__init__()
-        self.fnn = fnn_model
-        
-    def forward(self, t, y):
-        """torchdiffeq的函数签名是 func(t, y)"""
-        return self.fnn(y)
-
-# --- 2. 定義訓練流程 ---
+# --- 1. 定義訓練流程 ---
 # ===== 优化后的 FNN 损失 =====
 def calculate_loss_fnn(ode_model, patient_data, ab, pids, y0):
     """
@@ -87,6 +59,7 @@ def calculate_loss_fnn(ode_model, patient_data, ab, pids, y0):
     - 所有病人、所有 biomarker 的 s 值一次合并；
     - 去重、排序，确保 torchdiffeq 时间轴严格递增；
     - 在去重时间轴上解一次 ODE，再映射回原索引。
+    - 添加正则化项：在[-5:20:1]的向量上约束ODE右侧函数
     """
     try:
         s_all_list, y_true_list, k_list = [], [], []
@@ -124,12 +97,91 @@ def calculate_loss_fnn(ode_model, patient_data, ab, pids, y0):
         y_all = y_unique[inv]  # (N, 4)
         y_pred_selected = y_all[torch.arange(y_all.size(0)), k_sorted]
 
-        loss = ((y_pred_selected - y_sorted) ** 2).sum()
-        return loss if torch.isfinite(loss) else torch.tensor(float('inf'), requires_grad=True)
+        # 数据拟合损失 - 使用SmoothL1Loss
+        smooth_l1_loss = nn.SmoothL1Loss(reduction='sum')
+        data_loss = smooth_l1_loss(y_pred_selected, y_sorted)
+        
+        # === 正则化项 ===
+        # 1. 在[-5:20:1]的s值上求解ODE和右侧函数
+        s_reg = torch.arange(-5, 21, 1, device=y0.device, dtype=y0.dtype)  # [-5, -4, ..., 19, 20]
+        
+        # 确保从0开始积分到每个s值（需要包含0点）
+        s_reg_with_zero = torch.cat([torch.tensor([0.0], device=y0.device), s_reg[s_reg != 0]])
+        s_reg_with_zero, _ = torch.sort(s_reg_with_zero)
+        
+        # 求解ODE得到各点的y值
+        y_reg_all = torch_odeint(ode_model, y0, s_reg_with_zero, method='dopri5', rtol=1e-4, atol=1e-5)
+        
+        # 提取s_reg对应的y值
+        reg_indices = []
+        for s_val in s_reg:
+            idx = (s_reg_with_zero == s_val).nonzero(as_tuple=True)[0]
+            if len(idx) > 0:
+                reg_indices.append(idx[0].item())
+        y_reg = y_reg_all[reg_indices]  # (26, 4)
+        
+        # 计算每个点的dy/ds（ODE右侧函数）
+        dyds_list = []
+        for y_val in y_reg:
+            dyds = ode_model(0, y_val)  # (4,)
+            dyds_list.append(dyds)
+        dyds_all = torch.stack(dyds_list)  # (26, 4)
+        
+        # 2. 正则化损失：要求[-5,0]和[15,20]区间平（接近0），[0,10]区间斜（绝对值大）
+        # [-5, 0]: indices 0-5
+        flat_region_1 = dyds_all[0:6]  # s=-5 to s=0
+        # [15, 20]: indices 20-25
+        flat_region_2 = dyds_all[20:26]  # s=15 to s=20
+        # [0, 10]: indices 5-15
+        steep_region = dyds_all[5:16]  # s=0 to s=10
+        
+        # 平坦区域：惩罚绝对值大的导数
+        flat_loss = (flat_region_1 ** 2).sum() + (flat_region_2 ** 2).sum()
+        
+        # 陡峭区域：鼓励绝对值大的导数（负向惩罚）
+        steep_loss = 1.0 / (steep_region.abs().sum() + 1e-6)
+        
+        # 3. 参数正则化：惩罚a, b参数过大
+        param_reg_loss = 0.0
+        for pid in pids:
+            param_reg_loss += ab[pid]['a'] ** 2 + ab[pid]['b'] ** 2
+        
+        # 总损失：正则化项作为乘子施加在数据损失上
+        lambda_flat = 0.01   # 平坦区域正则化权重
+        lambda_steep = 0.01  # 陡峭区域正则化权重
+        lambda_param = 0.0001  # 参数正则化权重
+        
+        # 计算正则化乘子，使用clamp避免溢出
+        penalty_term = lambda_flat * flat_loss + lambda_param * param_reg_loss
+        penalty_term = torch.clamp(penalty_term, max=10.0)  # 限制在10以内，exp(10)≈22026
+        reward_term = lambda_steep * steep_region.abs().sum()
+        
+        reg_multiplier = torch.exp(penalty_term) / (1.0 + reward_term)
+        reg_multiplier = torch.clamp(reg_multiplier, min=0.1, max=10.0)  # 限制在[0.1, 10]范围内
+        
+        total_loss = data_loss * reg_multiplier
+        
+        # 返回总损失和各分量
+        loss_dict = {
+            'total': total_loss.item() if torch.isfinite(total_loss) else float('inf'),
+            'data': data_loss.item(),
+            'flat': flat_loss.item(),
+            'steep': steep_region.abs().sum().item(),
+            'param': param_reg_loss.item(),
+            'reg_mult': reg_multiplier.item()
+        }
+        
+        if torch.isfinite(total_loss):
+            return total_loss, loss_dict
+        else:
+            return torch.tensor(float('inf'), requires_grad=True), loss_dict
 
     except Exception as e:
         print(f"FNN loss 计算出错: {e}")
-        return torch.tensor(float('inf'), requires_grad=True)
+        import traceback
+        traceback.print_exc()
+        loss_dict = {'total': float('inf'), 'data': 0, 'flat': 0, 'steep': 0, 'param': 0, 'reg_mult': 1.0}
+        return torch.tensor(float('inf'), requires_grad=True), loss_dict
 
 
 # ===== 优化后的 DPS 损失 =====
@@ -184,19 +236,18 @@ def train_alternating(
     fnn_pretrained,
     patient_data,
     y0,
-    dps_path='dps.pth',
-    n_epochs=50,
-    lr_fnn=5e-4,         # FNN的LBFGS学习率
+    dps_path='dps_pretrain.pth',
+    n_epochs=80,
+    lr_fnn=1e-3,         # FNN的Adam学习率
     lr_dps=1e-3,         # DPS的LBFGS学习率
-    max_iter_fnn=20,     # FNN的LBFGS最大迭代次数
-    max_iter_dps=10      # DPS的LBFGS最大迭代次数
+    max_iter_dps=10,     # DPS的LBFGS最大迭代次数
 ):
     """
     交替优化FNN和DPS参数：
-    1. 用LBFGS优化FNN
+    1. 用Adam优化FNN
     2. 用LBFGS优化a,b参数
     """
-    print("\n--- 开始交替优化训练 (LBFGS) ---")
+    print("\n--- 开始交替优化训练 (Adam + LBFGS) ---")
     
     # 加载预训练的FNN模型
     ode_model = ODEModel(fnn_pretrained).train()
@@ -219,13 +270,8 @@ def train_alternating(
     patient_pids = list(ab.keys())
     dps_params = [p for pid in patient_pids for p in ab[pid].values()]
     
-    # 创建两个LBFGS优化器
-    opt_fnn = optim.LBFGS(
-        ode_model.parameters(),
-        lr=lr_fnn,
-        max_iter=max_iter_fnn,
-        line_search_fn="strong_wolfe"
-    )
+    # 创建两个优化器：Adam用于FNN，LBFGS用于DPS
+    opt_fnn = optim.Adam(ode_model.parameters(), lr=lr_fnn)
     
     opt_dps = optim.LBFGS(
         dps_params,
@@ -234,16 +280,23 @@ def train_alternating(
         line_search_fn="strong_wolfe"
     )
     
-    for epoch in range(n_epochs):
-        # --- 步骤 1: 用LBFGS优化FNN（按算法1步骤3-4，对每个biomarker分别算loss）---
-        def closure_fnn():
-            opt_fnn.zero_grad()
-            loss = calculate_loss_fnn(ode_model, patient_data, ab, patient_pids, y0)
-            if torch.isfinite(loss):
-                loss.backward()
-            return loss
-        
-        loss_fnn = opt_fnn.step(closure_fnn)
+    # 记录loss历史
+    loss_history = {
+        'epoch': [],
+        'fnn_loss': [],
+        'dps_loss': []
+    }
+    
+    # 使用tqdm显示进度条
+    progress_bar = tqdm(range(n_epochs), desc="训练进度", ncols=None)
+    
+    for epoch in progress_bar:
+        # --- 步骤 1: 用Adam优化FNN（按算法1步骤3-4，对每个biomarker分别算loss）---
+        opt_fnn.zero_grad()
+        loss_fnn, loss_fnn_dict = calculate_loss_fnn(ode_model, patient_data, ab, patient_pids, y0)
+        if torch.isfinite(loss_fnn):
+            loss_fnn.backward()
+            opt_fnn.step()
         
         # --- 步骤 2: 用LBFGS优化a,b参数（按算法1步骤8，对每个patient所有时间点算loss）---
         def closure_dps():
@@ -255,21 +308,33 @@ def train_alternating(
         
         loss_dps = opt_dps.step(closure_dps)
         
-        if (epoch + 1) % 5 == 0:
-            print(f"Epoch [{epoch+1}/{n_epochs}] | FNN Loss: {loss_fnn.item():.6f} | DPS Loss: {loss_dps.item():.6f}")
+        # 记录loss
+        loss_history['epoch'].append(epoch + 1)
+        loss_history['fnn_loss'].append(loss_fnn.item())
+        loss_history['dps_loss'].append(loss_dps.item())
+        
+        # 更新进度条显示的信息
+        progress_bar.set_postfix({
+            'FNN': f'{loss_fnn.item():.1f}',
+            'D': f'{loss_fnn_dict["data"]:.1f}',
+            'Reg×': f'{loss_fnn_dict["reg_mult"]:.3f}',
+            'Flt': f'{loss_fnn_dict["flat"]:.2f}',
+            'Stp': f'{loss_fnn_dict["steep"]:.1f}',
+            'DPS': f'{loss_dps.item():.1f}'
+        })
     
     ode_model.eval()
     print("交替优化训练完成！")
-    return ode_model, ab
+    return ode_model, ab, loss_history
 
 
-# --- 3. 主程序 ---
-if __name__ == '__main__':
-    # 加载预训练的FNN模型
-    print("\n--- 加载预训练的FNN模型 ---")
-    fnn_pretrained = ODENet(input_dim=4, hidden_dim=38, output_dim=4)
+# --- 3. 辅助函数：自动加载预训练模型 ---
+def load_pretrained_model(model_path='fnn_pretrain.pth'):
+    """
+    自动加载预训练模型，从state_dict推断模型结构
+    """
     try:
-        state_dict = torch.load('fnn.pth', weights_only=True)
+        state_dict = torch.load(model_path, weights_only=True)
         
         # 处理键名不匹配的情况（移除"fnn."前缀）
         if any(k.startswith('fnn.') for k in state_dict.keys()):
@@ -281,23 +346,44 @@ if __name__ == '__main__':
                     new_state_dict[k] = v
             state_dict = new_state_dict
         
-        fnn_pretrained.load_state_dict(state_dict)
-        print("成功从 fnn.pth 加载预训练模型。")
+        # 从state_dict自动推断hidden_dim
+        # fc1.weight的形状是 (hidden_dim, input_dim)
+        fc1_weight = state_dict['fc1.weight']
+        hidden_dim = fc1_weight.shape[0]
+        input_dim = fc1_weight.shape[1]
+        
+        # fc3.weight的形状是 (output_dim, hidden_dim)
+        fc3_weight = state_dict['fc3.weight']
+        output_dim = fc3_weight.shape[0]
+        
+        print(f"从 {model_path} 检测到模型结构: input_dim={input_dim}, hidden_dim={hidden_dim}, output_dim={output_dim}")
+        
+        # 创建模型并加载参数
+        model = ODENet(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
+        model.load_state_dict(state_dict)
+        print(f"成功加载预训练模型！")
+        
+        return model
+        
     except FileNotFoundError:
-        print("错误: 未找到 fnn.pth。请先运行 pretrain.py 生成此文件。")
+        print(f"错误: 未找到 {model_path}。请先运行 pretrain.py 生成此文件。")
         exit()
+    except Exception as e:
+        print(f"加载模型时出错: {e}")
+        exit()
+
+
+# --- 4. 主程序 ---
+if __name__ == '__main__':
+    # 加载预训练的FNN模型
+    print("\n--- 加载预训练的FNN模型 ---")
+    fnn_pretrained = load_pretrained_model('fnn_pretrain.pth')
     
     # 交替优化训练
-    final_model, trained_ab = train_alternating(
+    final_model, trained_ab, loss_history = train_alternating(
         fnn_pretrained,
         patient_data,
-        y0_cn_avg,
-        dps_path='dps.pth',
-        n_epochs=50,
-        lr_fnn=1e-3,
-        lr_dps=1e-3,
-        max_iter_fnn=20,
-        max_iter_dps=10
+        y0_cn_avg
     )
     
     if final_model is None:
@@ -308,6 +394,32 @@ if __name__ == '__main__':
     torch.save(trained_ab, f'dps_{name}.pth')
     print(f"\n模型已保存到 {name}.pth")
     print(f"DPS参数已保存到 dps_{name}.pth")
+    
+    # --- 绘制损失曲线 ---
+    print("\n--- 绘制损失曲线 ---")
+    fig_loss, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # FNN Loss
+    ax1.plot(loss_history['epoch'], loss_history['fnn_loss'], 'b-', linewidth=2)
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('FNN Loss', fontsize=12)
+    ax1.set_title('FNN Loss Curve', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale('log')  # 使用对数刻度更清晰
+    
+    # DPS Loss
+    ax2.plot(loss_history['epoch'], loss_history['dps_loss'], 'r-', linewidth=2)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('DPS Loss', fontsize=12)
+    ax2.set_title('DPS Loss Curve', fontsize=14)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')  # 使用对数刻度更清晰
+    
+    plt.tight_layout()
+    loss_curve_filename = f'{name}_loss_curve.png'
+    plt.savefig(loss_curve_filename)
+    print(f"损失曲线已保存到 {loss_curve_filename}")
+    plt.show()
     
     # --- 绘图 ---
     print("\n--- 生成可视化结果 ---")
@@ -371,5 +483,29 @@ if __name__ == '__main__':
         plt.savefig(f'{name}.png')
         print(f"结果图已保存到 {name}.png")
         plt.show()
+    
+    # --- 保存病人参数到Excel ---
+    print("\n--- 保存病人参数 ---")
+    patient_params_list = []
+    for pid in sorted(trained_ab.keys()):
+        a_value = trained_ab[pid]['a'].item()
+        b_value = trained_ab[pid]['b'].item()
+        stage = patient_data[pid]['stage'] if pid in patient_data else 'Unknown'
+        patient_params_list.append({
+            'PID': pid,
+            'Stage': stage,
+            'a': a_value,
+            'b': b_value
+        })
+    
+    # 创建DataFrame并保存为Excel
+    params_df = pd.DataFrame(patient_params_list)
+    excel_filename = f'dps_params.xlsx'
+    params_df.to_excel(excel_filename, index=False)
+    print(f"病人参数已保存到 {excel_filename}")
+    print(f"共 {len(params_df)} 位病人的参数已记录")
+    print(f"\n参数统计:")
+    print(f"  a参数: 均值={params_df['a'].mean():.4f}, 标准差={params_df['a'].std():.4f}, 范围=[{params_df['a'].min():.4f}, {params_df['a'].max():.4f}]")
+    print(f"  b参数: 均值={params_df['b'].mean():.4f}, 标准差={params_df['b'].std():.4f}, 范围=[{params_df['b'].min():.4f}, {params_df['b'].max():.4f}]")
     
     print("\n完整流程执行完毕。")
