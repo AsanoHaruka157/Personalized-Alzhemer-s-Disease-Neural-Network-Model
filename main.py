@@ -102,73 +102,62 @@ def calculate_loss_fnn(ode_model, patient_data, ab, pids, y0):
         data_loss = smooth_l1_loss(y_pred_selected, y_sorted)
         
         # === 正则化项 ===
-        # 1. 在[-5:20:1]的s值上求解ODE和右侧函数
-        s_reg = torch.arange(-5, 21, 1, device=y0.device, dtype=y0.dtype)  # [-5, -4, ..., 19, 20]
+        # === 函数形状正则化（已注释） ===
+        # # 1. 在[-5:20:1]的s值上求解ODE和右侧函数
+        # s_reg = torch.arange(-5, 21, 1, device=y0.device, dtype=y0.dtype)  # [-5, -4, ..., 19, 20]
+        # 
+        # # 确保从0开始积分到每个s值（需要包含0点）
+        # s_reg_with_zero = torch.cat([torch.tensor([0.0], device=y0.device), s_reg[s_reg != 0]])
+        # s_reg_with_zero, _ = torch.sort(s_reg_with_zero)
+        # 
+        # # 求解ODE得到各点的y值
+        # y_reg_all = torch_odeint(ode_model, y0, s_reg_with_zero, method='dopri5', rtol=1e-4, atol=1e-5)
+        # 
+        # # 提取s_reg对应的y值
+        # reg_indices = []
+        # for s_val in s_reg:
+        #     idx = (s_reg_with_zero == s_val).nonzero(as_tuple=True)[0]
+        #     if len(idx) > 0:
+        #         reg_indices.append(idx[0].item())
+        # y_reg = y_reg_all[reg_indices]  # (26, 4)
+        # 
+        # # 计算每个点的dy/ds（ODE右侧函数）
+        # dyds_list = []
+        # for y_val in y_reg:
+        #     dyds = ode_model(0, y_val)  # (4,)
+        #     dyds_list.append(dyds)
+        # dyds_all = torch.stack(dyds_list)  # (26, 4)
+        # 
+        # # 2. 正则化损失：要求[-5,0]和[15,20]区间平（接近0），[0,10]区间斜（绝对值大）
+        # # [-5, 0]: indices 0-5
+        # flat_region_1 = dyds_all[0:6]  # s=-5 to s=0
+        # # [15, 20]: indices 20-25
+        # flat_region_2 = dyds_all[20:26]  # s=15 to s=20
+        # # [0, 10]: indices 5-15
+        # steep_region = dyds_all[5:16]  # s=0 to s=10
+        # 
+        # # 平坦区域：惩罚绝对值大的导数
+        # flat_loss = (flat_region_1 ** 2).sum() + (flat_region_2 ** 2).sum()
+        # 
+        # # 陡峭区域：鼓励绝对值大的导数（负向惩罚）
+        # steep_loss = 1.0 / (steep_region.abs().sum() + 1e-6)
         
-        # 确保从0开始积分到每个s值（需要包含0点）
-        s_reg_with_zero = torch.cat([torch.tensor([0.0], device=y0.device), s_reg[s_reg != 0]])
-        s_reg_with_zero, _ = torch.sort(s_reg_with_zero)
-        
-        # 求解ODE得到各点的y值
-        y_reg_all = torch_odeint(ode_model, y0, s_reg_with_zero, method='dopri5', rtol=1e-4, atol=1e-5)
-        
-        # 提取s_reg对应的y值
-        reg_indices = []
-        for s_val in s_reg:
-            idx = (s_reg_with_zero == s_val).nonzero(as_tuple=True)[0]
-            if len(idx) > 0:
-                reg_indices.append(idx[0].item())
-        y_reg = y_reg_all[reg_indices]  # (26, 4)
-        
-        # 计算每个点的dy/ds（ODE右侧函数）
-        dyds_list = []
-        for y_val in y_reg:
-            dyds = ode_model(0, y_val)  # (4,)
-            dyds_list.append(dyds)
-        dyds_all = torch.stack(dyds_list)  # (26, 4)
-        
-        # 2. 正则化损失：要求[-5,0]和[15,20]区间平（接近0），[0,10]区间斜（绝对值大）
-        # [-5, 0]: indices 0-5
-        flat_region_1 = dyds_all[0:6]  # s=-5 to s=0
-        # [15, 20]: indices 20-25
-        flat_region_2 = dyds_all[20:26]  # s=15 to s=20
-        # [0, 10]: indices 5-15
-        steep_region = dyds_all[5:16]  # s=0 to s=10
-        
-        # 平坦区域：惩罚绝对值大的导数
-        flat_loss = (flat_region_1 ** 2).sum() + (flat_region_2 ** 2).sum()
-        
-        # 陡峭区域：鼓励绝对值大的导数（负向惩罚）
-        steep_loss = 1.0 / (steep_region.abs().sum() + 1e-6)
-        
-        # 3. 参数正则化：惩罚a, b参数过大
+        # 参数正则化：惩罚a, b参数过大
         param_reg_loss = 0.0
         for pid in pids:
             param_reg_loss += ab[pid]['a'] ** 2 + ab[pid]['b'] ** 2
         
-        # 总损失：正则化项作为乘子施加在数据损失上
-        lambda_flat = 0.01   # 平坦区域正则化权重
-        lambda_steep = 0.01  # 陡峭区域正则化权重
-        lambda_param = 0.0001  # 参数正则化权重
+        # 总损失：加法形式的参数正则化
+        lambda_param = 0.01  # 参数正则化权重
         
-        # 计算正则化乘子，使用clamp避免溢出
-        penalty_term = lambda_flat * flat_loss + lambda_param * param_reg_loss
-        penalty_term = torch.clamp(penalty_term, max=10.0)  # 限制在10以内，exp(10)≈22026
-        reward_term = lambda_steep * steep_region.abs().sum()
-        
-        reg_multiplier = torch.exp(penalty_term) / (1.0 + reward_term)
-        reg_multiplier = torch.clamp(reg_multiplier, min=0.1, max=10.0)  # 限制在[0.1, 10]范围内
-        
-        total_loss = data_loss * reg_multiplier
+        total_loss = data_loss + lambda_param * param_reg_loss
         
         # 返回总损失和各分量
         loss_dict = {
             'total': total_loss.item() if torch.isfinite(total_loss) else float('inf'),
             'data': data_loss.item(),
-            'flat': flat_loss.item(),
-            'steep': steep_region.abs().sum().item(),
             'param': param_reg_loss.item(),
-            'reg_mult': reg_multiplier.item()
+            'lambda': lambda_param
         }
         
         if torch.isfinite(total_loss):
@@ -180,7 +169,7 @@ def calculate_loss_fnn(ode_model, patient_data, ab, pids, y0):
         print(f"FNN loss 计算出错: {e}")
         import traceback
         traceback.print_exc()
-        loss_dict = {'total': float('inf'), 'data': 0, 'flat': 0, 'steep': 0, 'param': 0, 'reg_mult': 1.0}
+        loss_dict = {'total': float('inf'), 'data': 0, 'param': 0, 'lambda': 0.01}
         return torch.tensor(float('inf'), requires_grad=True), loss_dict
 
 
@@ -239,15 +228,14 @@ def train_alternating(
     dps_path='dps_pretrain.pth',
     n_epochs=80,
     lr_fnn=1e-3,         # FNN的Adam学习率
-    lr_dps=1e-3,         # DPS的LBFGS学习率
-    max_iter_dps=10,     # DPS的LBFGS最大迭代次数
+    lr_dps=1e-3,         # DPS的Adam学习率
 ):
     """
     交替优化FNN和DPS参数：
     1. 用Adam优化FNN
-    2. 用LBFGS优化a,b参数
+    2. 用Adam优化a,b参数
     """
-    print("\n--- 开始交替优化训练 (Adam + LBFGS) ---")
+    print("\n--- 开始交替优化训练 (Adam + Adam) ---")
     
     # 加载预训练的FNN模型
     ode_model = ODEModel(fnn_pretrained).train()
@@ -270,15 +258,9 @@ def train_alternating(
     patient_pids = list(ab.keys())
     dps_params = [p for pid in patient_pids for p in ab[pid].values()]
     
-    # 创建两个优化器：Adam用于FNN，LBFGS用于DPS
+    # 创建两个优化器：Adam用于FNN，Adam用于DPS
     opt_fnn = optim.Adam(ode_model.parameters(), lr=lr_fnn)
-    
-    opt_dps = optim.LBFGS(
-        dps_params,
-        lr=lr_dps,
-        max_iter=max_iter_dps,
-        line_search_fn="strong_wolfe"
-    )
+    opt_dps = optim.Adam(dps_params, lr=lr_dps)
     
     # 记录loss历史
     loss_history = {
@@ -298,15 +280,12 @@ def train_alternating(
             loss_fnn.backward()
             opt_fnn.step()
         
-        # --- 步骤 2: 用LBFGS优化a,b参数（按算法1步骤8，对每个patient所有时间点算loss）---
-        def closure_dps():
-            opt_dps.zero_grad()
-            loss = calculate_loss_dps(ode_model, patient_data, ab, patient_pids, y0)
-            if torch.isfinite(loss):
-                loss.backward()
-            return loss
-        
-        loss_dps = opt_dps.step(closure_dps)
+        # --- 步骤 2: 用Adam优化a,b参数（按算法1步骤8，对每个patient所有时间点算loss）---
+        opt_dps.zero_grad()
+        loss_dps = calculate_loss_dps(ode_model, patient_data, ab, patient_pids, y0)
+        if torch.isfinite(loss_dps):
+            loss_dps.backward()
+            opt_dps.step()
         
         # 记录loss
         loss_history['epoch'].append(epoch + 1)
@@ -317,9 +296,7 @@ def train_alternating(
         progress_bar.set_postfix({
             'FNN': f'{loss_fnn.item():.1f}',
             'D': f'{loss_fnn_dict["data"]:.1f}',
-            'Reg×': f'{loss_fnn_dict["reg_mult"]:.3f}',
-            'Flt': f'{loss_fnn_dict["flat"]:.2f}',
-            'Stp': f'{loss_fnn_dict["steep"]:.1f}',
+            'Prm': f'{loss_fnn_dict["param"]:.1f}',
             'DPS': f'{loss_dps.item():.1f}'
         })
     
@@ -478,7 +455,7 @@ if __name__ == '__main__':
             ax.grid(True, alpha=0.4)
             ax.set_title(TITLES[k])
         
-        fig.suptitle('FNN Model with Alternating Optimization (LBFGS)', fontsize=16)
+        fig.suptitle('FNN Model with Alternating Optimization (Adam)', fontsize=16)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(f'{name}.png')
         print(f"结果图已保存到 {name}.png")

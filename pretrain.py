@@ -184,7 +184,7 @@ def train_neural_network(y_target, dyds_target, epochs=20000, lr=1e-4, l1_lambda
     
     # 训练循环
     model.train()
-    progress_bar = tqdm(range(epochs), desc="预训练神经网络", ncols=120)
+    progress_bar = tqdm(range(epochs), desc="预训练神经网络", ncols=None)
     
     for epoch in progress_bar:
         optimizer.zero_grad()
