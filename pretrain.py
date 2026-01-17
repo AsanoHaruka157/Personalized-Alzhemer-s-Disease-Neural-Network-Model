@@ -4,7 +4,6 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-from scipy.integrate import odeint
 from tqdm import tqdm
 import pccmnn as pc # 假设您有这个文件来加载和反归一化数据
 
@@ -14,53 +13,75 @@ csf_dict = pc.load_data()
 stage_dict = pc.load_stage_dict()
 print(f"成功加载 {len(csf_dict)} 位患者的数据。")
 
-# --- 1. 为每位患者分配DPS变换参数 ---
+# --- 1. 为每位患者分配DPS变换参数（可优化版本）---
 def assign_dps_params(csf_dict, stage_dict):
     """
-    根据患者分期（CN, LMCI, AD）为每位患者指定 a 和 b 参数。
-    a: CN=1, LMCI=2, AD=4
-    b: 随机选择，使得初始s值落在指定区间内
+    为每位患者创建可优化的DPS变换参数 a 和 b。
+    a: CN=1, LMCI=2, AD=4 的初始值，但可优化
+    b: 随机初始化，但可优化
     """
     patient_data = {}
-    # 按照您的要求更新 s_ranges
+    # 按照您的要求更新 s_ranges（用于初始化b参数）
     s_ranges = {
         'CN': (-10, 0),
         'LMCI': (-2, 8),
         'AD': (5, 20),
         'Other': (-10, 20) # 为其他类型提供一个默认范围
     }
-    a_values = {'CN': 1.0, 'LMCI': 2.0, 'AD': 4.0, 'Other': 1.0}
+    a_init_values = {'CN': 1.0, 'LMCI': 2.0, 'AD': 4.0, 'Other': 1.0}
 
-    # 收集所有 (s, y) 点
+    # 为每个患者创建可优化的a和b参数
+    dps_params = {}
+    for pid, sample in csf_dict.items():
+        stage = stage_dict.get(pid, 'Other')
+        t = sample[:, 0]
+
+        # 初始化a参数（可优化）
+        a_init = a_init_values[stage]
+        a_param = nn.Parameter(torch.tensor(a_init, dtype=torch.float32))
+
+        # 初始化b参数（可优化），使其初始s值落在合理区间
+        s_min, s_max = s_ranges[stage]
+        t_initial = t[0]
+        s_initial_target = np.random.uniform(s_min, s_max)
+        b_init = s_initial_target - a_init * t_initial
+        b_param = nn.Parameter(torch.tensor(b_init, dtype=torch.float32))
+
+        dps_params[pid] = {'a': a_param, 'b': b_param, 'stage': stage}
+
+    return dps_params
+
+def compute_s_values(csf_dict, dps_params):
+    """
+    根据当前的DPS参数计算所有患者的s值
+    """
+    patient_data = {}
     all_s_points = []
     all_y_points = []
     all_stages = []
 
     for pid, sample in csf_dict.items():
-        stage = stage_dict.get(pid, 'Other')
         t = sample[:, 0]
         y = sample[:, 1:5]
 
-        a = a_values[stage]
-        s_min, s_max = s_ranges[stage]
-        
-        # 计算b，使s_initial落在目标区间
-        t_initial = t[0]
-        s_initial_target = np.random.uniform(s_min, s_max)
-        b = s_initial_target - a * t_initial
+        params = dps_params[pid]
+        a = params['a']
+        b = params['b']
+        stage = params['stage']
 
-        s = a * t + b
-        
-        patient_data[pid] = {'t': t, 'y': y, 's': s, 'stage': stage, 'a': a, 'b': b}
-        
-        all_s_points.append(s)
+        # 计算s = a*t + b
+        s = a * torch.tensor(t, dtype=torch.float32) + b
+
+        patient_data[pid] = {'t': t, 'y': y, 's': s.detach().numpy(), 'stage': stage, 'a': a.item(), 'b': b.item()}
+
+        all_s_points.append(s.detach().numpy())
         all_y_points.append(y)
         all_stages.extend([stage] * len(t))
 
     # 将列表转换为Numpy数组
     s_population = np.concatenate(all_s_points)
     y_population = np.concatenate(all_y_points)
-    
+
     return patient_data, s_population, y_population, all_stages
 
 # --- 新增功能：计算CN群体的平均初始值 ---
@@ -98,14 +119,14 @@ def fit_sigmoids(s_data, y_data):
     print("正在为4个生物标记物拟合Sigmoid曲线...")
     for k in range(4):
         y_k = y_data[:, k]
-        
+
         # 去掉NaN值
         valid_mask = ~np.isnan(y_k)
         s_k_valid = s_data[valid_mask]
         y_k_valid = y_k[valid_mask]
-        
+
         print(f"  - Biomarker {k+1}: {len(y_k_valid)}/{len(y_k)} 个有效数据点")
-        
+
         # 为curve_fit提供一个较好的初始猜测值
         p0 = [
             np.max(y_k_valid) - np.min(y_k_valid),  # a: 幅度
@@ -113,141 +134,257 @@ def fit_sigmoids(s_data, y_data):
             np.median(s_k_valid),                    # c: 中心点
             np.min(y_k_valid)                        # d: 垂直偏移
         ]
-        try:
-            params, _ = curve_fit(sigmoid, s_k_valid, y_k_valid, p0=p0, maxfev=10000)
-            sigmoid_params.append(params)
-            print(f"    拟合成功。")
-        except RuntimeError:
-            print(f"    拟合失败，将使用初始值。")
-            sigmoid_params.append(p0)
-            
+
+        params, _ = curve_fit(sigmoid, s_k_valid, y_k_valid, p0=p0, maxfev=10000)
+        sigmoid_params.append(params)
+
     return np.array(sigmoid_params)
 
-# --- 3. 定义神经网络模型 ---
-class ODENet(nn.Module):
-    """单隐藏层神经网络用于学习dy/ds"""
-    def __init__(self, input_dim=4, hidden_dim=4, output_dim=4):
-        super(ODENet, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, output_dim)
-        self.activation = nn.Tanh()
-        
-    def forward(self, y):
-        """
-        输入: y (batch_size, 4) - 4个生物标记物的值
-        输出: dy/ds (batch_size, 4) - 4个导数
-        """
-        h = self.activation(self.fc1(y))
-        dyds = self.activation(self.fc3(h))
-        return dyds
-
-
-class ODEModel(nn.Module):
-    """ODE模型包装器，用于torchdiffeq"""
-    def __init__(self, fnn_model):
+class DifferentiableSigmoidFit(nn.Module):
+    """可微分的sigmoid拟合模型"""
+    def __init__(self, num_biomarkers=4):
         super().__init__()
-        self.fnn = fnn_model
-        
-    def forward(self, t, y):
-        """torchdiffeq的函数签名是 func(t, y)"""
-        return self.fnn(y)
+        # 为每个biomarker创建可训练的sigmoid参数 [a, b, c, d]
+        # a: 幅度, b: 斜率, c: 中心点, d: 偏移
+        # 根据AD疾病特征设置初始斜率：
+        # Biomarker 0 (Abeta): 负斜率 (下降)
+        # Biomarker 1 (p-Tau): 正斜率 (上升)
+        # Biomarker 2 (N): 负斜率 (下降)
+        # Biomarker 3 (C): 正斜率 (上升)
+        initial_params = [
+            [1.0, -1.0, 0.0, 0.0],  # Abeta: 负斜率 (下降)
+            [1.0, 1.0, 0.0, 0.0],   # p-Tau: 正斜率 (上升)
+            [1.0, -1.0, 0.0, 0.0],  # N: 负斜率 (下降)
+            [1.0, 1.0, 0.0, 0.0]    # C: 正斜率 (上升)
+        ]
+        self.sigmoid_params = nn.ParameterList([
+            nn.Parameter(torch.tensor(initial_params[i], dtype=torch.float32))
+            for i in range(num_biomarkers)
+        ])
 
+    def forward(self, s):
+        """
+        计算sigmoid函数值
+        s: (batch_size,) - s值数组
+        返回: (batch_size, 4) - 每个biomarker在每个s值处的预测
+        """
+        s = s.unsqueeze(-1) if s.dim() == 1 else s  # (batch_size, 1)
+        results = []
+        for i in range(4):
+            a, b, c, d = self.sigmoid_params[i]
+            # 广播计算: s.shape = (batch_size, 1), 参数都是标量
+            y = a / (1.0 + torch.exp(-b * (s - c))) + d  # (batch_size, 1)
+            results.append(y.squeeze(-1))  # (batch_size,)
+        return torch.stack(results, dim=-1)  # (batch_size, 4)
 
+def fit_sigmoids_differentiable(s_data, y_data, epochs=1000, lr=1e-3):
+    """可微分版本的sigmoid拟合，使用改进的损失函数"""
+
+    # 转换为PyTorch张量
+    s_tensor = torch.tensor(s_data, dtype=torch.float32)
+    y_tensor = torch.tensor(y_data, dtype=torch.float32)
+
+    # 计算数据范围，用于防止坍缩成直线的约束
+    s_range = s_data.max() - s_data.min()
+
+    # 创建模型
+    model = DifferentiableSigmoidFit()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    mse_criterion = nn.MSELoss()
+
+    best_loss = float('inf')
+    best_params = None
+
+    # 训练
+    model.train()
+    progress_bar = tqdm(range(epochs), desc="Sigmoid拟合", ncols=None, leave=False)
+
+    for epoch in progress_bar:
+        optimizer.zero_grad()
+
+        # 前向传播
+        y_pred = model(s_tensor)
+
+        # 基础损失：数据拟合损失
+        valid_mask = ~torch.isnan(y_tensor)
+        fit_loss = mse_criterion(y_pred[valid_mask], y_tensor[valid_mask])
+
+        # 改进的损失项
+        total_loss = fit_loss.clone()
+
+        # 1. 锁定核心参数：B值接近1的正则化
+        b_regularization = 0.0
+        slope_max_penalty = 0.0
+        curvature_penalty = 0.0
+
+        for i in range(4):
+            a, b, c, d = model.sigmoid_params[i]
+
+            # B值正则化：根据biomarker特征设置目标B值
+            # Biomarker 0 (Abeta): 目标B = -1 (下降)
+            # Biomarker 1 (p-Tau): 目标B = 1 (上升)
+            # Biomarker 2 (N): 目标B = -1 (下降)
+            # Biomarker 3 (C): 目标B = 1 (上升)
+            target_b_values = [-1.0, 1.0, -1.0, 1.0]  # 对应4个biomarker的目标B值
+            target_b = target_b_values[i]
+            b_regularization += (b - target_b) ** 2
+
+            # 2. 控制导数极值：防止太陡或太扁
+            # Sigmoid在拐点处的最大斜率：Slope_max = (a*b)/4
+            # 这是因为sigmoid函数 y = a/(1+exp(-b(x-c))) + d 的导数在x=c处最大值为 (a*b)/4
+            slope_max = torch.abs(a * b) / 4.0
+            k_min, k_max = 0.1, 2.0  # 斜率合理范围
+
+            # 防止太扁（坍缩成直线）
+            slope_penalty_min = torch.relu(k_min - slope_max) ** 2
+            # 防止太陡（像墙一样陡）
+            slope_penalty_max = torch.relu(slope_max - k_max) ** 2
+            slope_max_penalty += slope_penalty_min + slope_penalty_max
+
+            # 3. 防止坍缩成直线的特殊技巧：控制B与数据范围的关系
+            # 理想的B值应该在 4/(x_range) 到 6/(x_range) 之间
+            ideal_b_min = 4.0 / s_range
+            ideal_b_max = 6.0 / s_range
+            b_range_penalty = torch.relu(ideal_b_min - torch.abs(b)) ** 2 + torch.relu(torch.abs(b) - ideal_b_max) ** 2
+            curvature_penalty += b_range_penalty
+
+        # 组合损失
+        lambda_b = 1.0          # B值正则化权重
+        lambda_slope = 0.5      # 斜率约束权重
+        lambda_curvature = 0.2  # 曲率约束权重
+
+        regularization_loss = lambda_b * b_regularization + \
+                             lambda_slope * slope_max_penalty + \
+                             lambda_curvature * curvature_penalty
+
+        total_loss += regularization_loss
+
+        # 反向传播
+        total_loss.backward()
+        optimizer.step()
+
+        # 保存最佳参数
+        if total_loss.item() < best_loss:
+            best_loss = total_loss.item()
+            best_params = [param.clone() for param in model.sigmoid_params]
+
+        # 更新进度条
+        progress_bar.set_postfix({
+            'Fit': f'{fit_loss.item():.6f}',
+            'Reg': f'{regularization_loss.item():.6f}',
+            'Total': f'{total_loss.item():.6f}'
+        })
+
+    # 使用最佳参数
+    if best_params is not None:
+        for i in range(4):
+            model.sigmoid_params[i].data = best_params[i].data
+
+    model.eval()
+    # 返回参数
+    sigmoid_params = []
+    for i in range(4):
+        params = model.sigmoid_params[i].detach().numpy()
+        sigmoid_params.append(params)
+
+    return np.array(sigmoid_params)
+
+def train_sigmoid_curves(csf_dict, dps_params, num_iterations=20):
+    """
+    只训练sigmoid曲线，不再优化DPS参数
+    使用改进的损失函数确保sigmoid曲线有良好的形态
+    """
+    print(f"\n开始训练sigmoid曲线，共 {num_iterations} 次迭代...")
+
+    best_curvature = -float('inf')
+    best_sigmoid_params = None
+    first_iteration_done = False
+
+    progress_bar = tqdm(range(num_iterations), desc="Sigmoid训练", ncols=None)
+
+    for iteration in progress_bar:
+        # 使用固定的DPS参数计算s值并拟合sigmoid
+        patient_data, s_pop, y_pop_norm, stages_pop = compute_s_values(csf_dict, dps_params)
+        sigmoid_params = fit_sigmoids_differentiable(s_pop, y_pop_norm)
+
+        # 计算s_grid并评估曲率
+        s_min, s_max = s_pop.min(), s_pop.max()
+        s_margin = (s_max - s_min) * 0.1
+        s_grid = np.linspace(s_min - s_margin, s_max + s_margin, 300)
+
+        curvature_grid = compute_sigmoid_curvature(s_grid, sigmoid_params)
+        total_curvature = get_total_curvature(curvature_grid)
+
+        # 保存最佳结果
+        # 第一次迭代总是保存，即使曲率是NaN
+        if not first_iteration_done or (not np.isnan(total_curvature) and total_curvature > best_curvature):
+            best_curvature = total_curvature if not np.isnan(total_curvature) else best_curvature
+            best_sigmoid_params = sigmoid_params.copy()
+            first_iteration_done = True
+
+        # 更新进度条
+        progress_bar.set_postfix({
+            '曲率': f'{total_curvature:.2f}' if not np.isnan(total_curvature) else 'NaN'
+        })
+
+    print(f"\nSigmoid训练完成！最佳曲率: {best_curvature:.6f}")
+
+    return best_sigmoid_params
+
+# --- 3. 定义神经网络模型 ---
 def get_sigmoid_derivatives(s_grid, params):
     """计算sigmoid函数在网格点上的值和解析导数"""
     y_on_grid = np.zeros((len(s_grid), 4))
     dyds_on_grid = np.zeros((len(s_grid), 4))
-    
+
     for k in range(4):
         a, b, c, d = params[k]
         exp_term = np.exp(-b * (s_grid - c))
         y_on_grid[:, k] = a / (1.0 + exp_term) + d
         dyds_on_grid[:, k] = (a * b * exp_term) / ((1.0 + exp_term)**2)
-        
+
     return y_on_grid, dyds_on_grid
 
-def train_neural_network(y_target, dyds_target, epochs=20000, lr=1e-4, l1_lambda=1e-5):
-    """训练神经网络来拟合sigmoid导数，使用Lasso稀疏化（L1正则化）"""
-    print("正在训练神经网络模型（带L1稀疏化）...")
-    print(f"L1正则化系数: {l1_lambda}")
-    
-    # 转换为PyTorch张量
-    y_tensor = torch.tensor(y_target, dtype=torch.float32)
-    dyds_tensor = torch.tensor(dyds_target, dtype=torch.float32)
-    
-    # 创建模型
-    model = ODENet()
-    
-    # 定义损失函数和优化器
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    # 训练循环
-    model.train()
-    progress_bar = tqdm(range(epochs), desc="预训练神经网络", ncols=None)
-    
-    for epoch in progress_bar:
-        optimizer.zero_grad()
-        
-        # 前向传播
-        dyds_pred = model(y_tensor)
-        
-        # 计算MSE损失
-        mse_loss = criterion(dyds_pred, dyds_tensor)
-        
-        # 添加L1正则化（Lasso稀疏化）
-        l1_penalty = 0.0
-        for param in model.parameters():
-            l1_penalty += torch.sum(torch.abs(param))
-        
-        # 总损失 = MSE损失 + L1惩罚
-        total_loss = mse_loss + l1_lambda * l1_penalty
-        
-        # 反向传播和优化
-        total_loss.backward()
-        optimizer.step()
-        
-        # 更新进度条
-        progress_bar.set_postfix({
-            'MSE': f'{mse_loss.item():.6f}',
-            'L1': f'{l1_penalty.item():.6f}',
-            'Total': f'{total_loss.item():.6f}'
-        })
-    
-    print("神经网络训练完成！")
-    model.eval()
-    return model
+def compute_sigmoid_curvature(s_grid, params):
+    """计算sigmoid函数在网格点上的曲率（使用二阶导数的绝对值作为曲率指标）"""
+    curvature_on_grid = np.zeros((len(s_grid), 4))
 
-# --- 4. 绘图与ODE求解 ---
-def ode_system(y, s, model):
-    """定义神经网络ODE系统，供求解器使用"""
-    # 将numpy数组转换为tensor
-    y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(0)  # (1, 4)
-    
-    # 使用神经网络预测导数
-    with torch.no_grad():
-        dyds_tensor = model(y_tensor)
-    
-    # 转换回numpy数组
-    dyds = dyds_tensor.squeeze(0).numpy()
-    
-    return dyds
+    for k in range(4):
+        a, b, c, d = params[k]
 
-def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, model, y0_norm):
+        # 数值稳定性：限制参数范围
+        b = np.clip(b, 0.1, 10.0)  # 限制b在合理范围内
+        a = np.clip(a, -10.0, 10.0)  # 限制a的范围
+
+        # 数值稳定的指数计算
+        exp_arg = -b * (s_grid - c)
+        exp_arg = np.clip(exp_arg, -50.0, 50.0)  # 防止溢出
+        exp_term = np.exp(exp_arg)
+        denominator = (1.0 + exp_term) ** 3
+
+        # 二阶导数：d²y/ds² = a*b²*exp(-b*(s-c))*(exp(-b*(s-c))-1) / (1 + exp(-b*(s-c)))^3
+        d2yds2 = a * b**2 * exp_term * (exp_term - 1) / denominator
+
+        # 使用二阶导数的绝对值作为曲率指标
+        curvature_on_grid[:, k] = np.abs(d2yds2)
+
+    return curvature_on_grid
+
+def get_total_curvature(curvature_grid):
+    """计算总曲率（所有biomarker在所有网格点的曲率之和）"""
+    return np.sum(curvature_grid)
+
+# --- 4. 绘图 ---
+def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params):
     """绘制最终结果图"""
-    print("正在生成最终结果图...")
+    print("📊 正在生成最终结果图...")
+
     # 反归一化，准备绘图
     y_pop_orig = pc.inv_nor(y_pop)
 
     # 计算Sigmoid函数值（直接计算）
     y_sigmoid_grid_norm, _ = get_sigmoid_derivatives(s_grid, sigmoid_params)
     y_sigmoid_grid_orig = pc.inv_nor(y_sigmoid_grid_norm)
-    
-    # 神经网络轨迹：从sigmoid在起点的值开始积分（使用相同的初值）
-    y0_sigmoid = y_sigmoid_grid_norm[0]  # sigmoid在s_grid起点的值
-    print(f"使用相同的初始值 (归一化): {y0_sigmoid}")
-    y_nn_traj_norm = odeint(ode_system, y0_sigmoid, s_grid, args=(model,))
-    y_nn_traj_orig = pc.inv_nor(y_nn_traj_norm)
 
     TITLES = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
     colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
@@ -272,9 +409,6 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, model, y0_nor
 
         # 绘制Sigmoid拟合曲线
         ax.plot(s_grid, y_sigmoid_grid_orig[:, k], 'r-', lw=2.5, label='Sigmoid Fit', zorder=3)
-        
-        # 绘制神经网络ODE轨迹（从相同初始值开始）
-        ax.plot(s_grid, y_nn_traj_orig[:, k], 'k--', lw=2.5, label='Neural ODE', zorder=3)
 
         ax.set_xlabel('Disease Progression Score (s)')
         ax.set_ylabel(TITLES[k])
@@ -286,144 +420,46 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params, model, y0_nor
         ax.grid(True, alpha=0.4)
         ax.set_title(f'Trajectory for {TITLES[k]}')
 
-    fig.suptitle('AD Biomarker Trajectories: Sigmoid Fit vs. Neural ODE', fontsize=16)
+    fig.suptitle('AD Biomarker Trajectories: Sigmoid Fit', fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig('pretrain.png')
     plt.show()
 
 
-def plot_parameter_distribution(model):
-    """绘制神经网络参数分布的直方图"""
-    print("\n正在生成神经网络参数分布图...")
-    
-    # 收集所有参数值
-    all_params = []
-    param_counts = {}
-    
-    for name, param in model.named_parameters():
-        param_values = param.data.cpu().numpy().flatten()
-        all_params.extend(param_values)
-        param_counts[name] = len(param_values)
-    
-    all_params = np.array(all_params)
-    
-    # 统计信息
-    print(f"\n神经网络参数统计:")
-    print(f"  总参数数量: {len(all_params)}")
-    print(f"  均值: {all_params.mean():.6f}")
-    print(f"  标准差: {all_params.std():.6f}")
-    print(f"  最小值: {all_params.min():.6f}")
-    print(f"  最大值: {all_params.max():.6f}")
-    
-    # 统计接近0的参数（稀疏性指标）
-    threshold = 1e-3
-    near_zero = np.abs(all_params) < threshold
-    sparsity = near_zero.sum() / len(all_params) * 100
-    print(f"  接近0的参数比例 (|w| < {threshold}): {sparsity:.2f}%")
-    
-    # 创建图形
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    # 子图1: 所有参数的直方图
-    ax1 = axes[0, 0]
-    ax1.hist(all_params, bins=100, alpha=0.7, color='blue', edgecolor='black')
-    ax1.set_xlabel('Parameter Value')
-    ax1.set_ylabel('Frequency')
-    ax1.set_title('All Parameters Distribution')
-    ax1.grid(True, alpha=0.3)
-    ax1.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
-    ax1.legend()
-    
-    # 子图2: 参数绝对值的直方图（对数刻度）
-    ax2 = axes[0, 1]
-    abs_params = np.abs(all_params)
-    ax2.hist(abs_params, bins=100, alpha=0.7, color='green', edgecolor='black')
-    ax2.set_xlabel('|Parameter Value|')
-    ax2.set_ylabel('Frequency')
-    ax2.set_title('Absolute Parameter Values (Log Scale)')
-    ax2.set_yscale('log')
-    ax2.grid(True, alpha=0.3)
-    
-    # 子图3: 各层参数的箱线图
-    ax3 = axes[1, 0]
-    layer_params = []
-    layer_names = []
-    for name, param in model.named_parameters():
-        layer_params.append(param.data.cpu().numpy().flatten())
-        layer_names.append(name)
-    
-    bp = ax3.boxplot(layer_params, labels=layer_names, patch_artist=True)
-    for patch in bp['boxes']:
-        patch.set_facecolor('lightblue')
-    ax3.set_ylabel('Parameter Value')
-    ax3.set_title('Parameter Distribution by Layer')
-    ax3.grid(True, alpha=0.3)
-    ax3.tick_params(axis='x', rotation=45)
-    
-    # 子图4: 稀疏性统计（各层）
-    ax4 = axes[1, 1]
-    layer_sparsity = []
-    for param_vals in layer_params:
-        layer_near_zero = np.abs(param_vals) < threshold
-        layer_sparsity.append(layer_near_zero.sum() / len(param_vals) * 100)
-    
-    bars = ax4.bar(range(len(layer_names)), layer_sparsity, color='orange', alpha=0.7, edgecolor='black')
-    ax4.set_xlabel('Layer')
-    ax4.set_ylabel(f'Sparsity (% with |w| < {threshold})')
-    ax4.set_title('Sparsity by Layer')
-    ax4.set_xticks(range(len(layer_names)))
-    ax4.set_xticklabels(layer_names, rotation=45, ha='right')
-    ax4.grid(True, alpha=0.3, axis='y')
-    
-    # 在柱状图上显示数值
-    for i, bar in enumerate(bars):
-        height = bar.get_height()
-        ax4.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    plt.savefig('parameter_distribution.png')
-    print("参数分布图已保存到 parameter_distribution.png")
-    plt.show()
-
 
 if __name__ == '__main__':
     # --- 执行Pipeline ---
-    # 1. 分配DPS参数并获取人群数据点
-    patient_data, s_pop, y_pop_norm, stages_pop = assign_dps_params(csf_dict, stage_dict)
+    print("开始预训练流程...")
 
-    # 1.5. 从CN群体计算平均初始值
+    # 1. 初始化可优化的DPS参数
+    print("初始化DPS参数...")
+    dps_params = assign_dps_params(csf_dict, stage_dict)
+
+    # 2. 训练sigmoid曲线（固定DPS参数）
+    print("训练sigmoid曲线...")
+    sigmoid_params = train_sigmoid_curves(csf_dict, dps_params, num_iterations=20)
+
+    # 3. 计算最终的s值和患者数据
+    print("计算最终s值...")
+    patient_data, s_pop, y_pop_norm, stages_pop = compute_s_values(csf_dict, dps_params)
+
+    # 3.5. 从CN群体计算平均初始值
+    print("计算CN群体平均初始值...")
     y0_cn_avg_norm = get_cn_average_y0(patient_data)
 
-    # 2. 拟合Sigmoid函数
-    sigmoid_params = fit_sigmoids(s_pop, y_pop_norm)
-
-    # 3. 训练神经网络模型
+    # 4. 生成结果图表
+    print("生成结果图表...")
     # 根据实际数据范围动态设置s_grid，并稍微扩展范围
     s_min, s_max = s_pop.min(), s_pop.max()
     s_margin = (s_max - s_min) * 0.1  # 扩展10%的边距
     s_grid = np.linspace(s_min - s_margin, s_max + s_margin, 300)
-    print(f"s_grid范围: [{s_grid.min():.2f}, {s_grid.max():.2f}]")
-    
-    y_sigmoid_grid_norm, dyds_sigmoid_grid_norm = get_sigmoid_derivatives(s_grid, sigmoid_params)
-    nn_model = train_neural_network(y_sigmoid_grid_norm, dyds_sigmoid_grid_norm)
-    
-    # 4. 求解ODE并绘图
-    plot_results(s_pop, y_pop_norm, stages_pop, s_grid, sigmoid_params, nn_model, y0_cn_avg_norm)
-    
-    # 5. 保存模型参数
-    # 保存神经网络模型
-    torch.save(nn_model.state_dict(), 'fnn_pretrain.pth')
-    print("神经网络模型已保存到 fnn_pretrain.pth")
 
-    # 保存DPS参数
+    plot_results(s_pop, y_pop_norm, stages_pop, s_grid, sigmoid_params)
+
+    # 5. 保存DPS参数
+    print("保存模型参数...")
     dps_params_dict = {}
-    for pid, data in patient_data.items():
-        dps_params_dict[pid] = {'a': data['a'], 'b': data['b']}
+    for pid, params in dps_params.items():
+        dps_params_dict[pid] = {'a': params['a'].item(), 'b': params['b'].item()}
     torch.save(dps_params_dict, 'dps_pretrain.pth')
     print("DPS参数已保存到 dps_pretrain.pth")
-    
-    # 6. 绘制神经网络参数分布图
-    plot_parameter_distribution(nn_model)
-    
-    print("\n流程执行完毕。")
