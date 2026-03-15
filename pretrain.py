@@ -196,24 +196,12 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     # 幅度不要过大：|a| <= target_amp_max
     amp_pen = max(0.0, np.abs(a) - target_amp_max) * np.sqrt(w_curv)
 
-    # 增强"两个拐点"约束：不仅要接近目标值，还要在指定范围内
+    # 仍保留"两个拐点"约束
     b_safe = b if np.abs(b) > 1e-6 else 1e-6
     turn_left = c - (np.log(2.0) / b_safe)
     turn_right = c + (np.log(2.0) / b_safe)
-    
-    # 左拐点约束：接近0且在[-2, 2]范围内
-    turn_pen_left = (turn_left - 0.0) ** 2 * np.sqrt(w_turn)
-    if turn_left < -2.0:
-        turn_pen_left += ((-2.0 - turn_left) ** 2) * np.sqrt(w_turn)
-    elif turn_left > 2.0:
-        turn_pen_left += ((turn_left - 2.0) ** 2) * np.sqrt(w_turn)
-    
-    # 右拐点约束：接近10且在[8, 12]范围内
-    turn_pen_right = (turn_right - 10.0) ** 2 * np.sqrt(w_turn)
-    if turn_right < 8.0:
-        turn_pen_right += ((8.0 - turn_right) ** 2) * np.sqrt(w_turn)
-    elif turn_right > 12.0:
-        turn_pen_right += ((turn_right - 12.0) ** 2) * np.sqrt(w_turn)
+    turn_pen_left = (turn_left - 0.0) * np.sqrt(w_turn)
+    turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn)
 
     reg_terms = np.array([
         turn_pen_left,
@@ -242,7 +230,7 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     w_cn = reg_cfg['w_cn']
     w_plat = reg_cfg['w_plat']
     target_b_abs = reg_cfg['target_b_abs']
-    target_b_max = reg_cfg.get('target_b_max', 0.5)
+    target_b_max = reg_cfg.get('target_b_max', 0.9)
 
     # 让曲线经过指定点 (s_target, y_target)
     s_target = reg_cfg.get('s_target', 0.0)
@@ -265,24 +253,12 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     curv_pen_low = max(0.0, target_b_abs - np.abs(b)) * np.sqrt(w_curv)
     curv_pen_high = max(0.0, np.abs(b) - target_b_max) * np.sqrt(w_curv)
 
-    # 增强"两个拐点"约束：不仅要接近目标值，还要在指定范围内
+    # 仍保留"两个拐点"约束
     b_safe = b if np.abs(b) > 1e-6 else 1e-6
     turn_left = c - (np.log(2.0) / b_safe)
     turn_right = c + (np.log(2.0) / b_safe)
-    
-    # 左拐点约束：接近0且在[-2, 2]范围内
-    turn_pen_left = (turn_left - 0.0) ** 2 * np.sqrt(w_turn)
-    if turn_left < -2.0:
-        turn_pen_left += ((-2.0 - turn_left) ** 2) * np.sqrt(w_turn)
-    elif turn_left > 2.0:
-        turn_pen_left += ((turn_left - 2.0) ** 2) * np.sqrt(w_turn)
-    
-    # 右拐点约束：接近10且在[8, 12]范围内
-    turn_pen_right = (turn_right - 10.0) ** 2 * np.sqrt(w_turn)
-    if turn_right < 8.0:
-        turn_pen_right += ((8.0 - turn_right) ** 2) * np.sqrt(w_turn)
-    elif turn_right > 12.0:
-        turn_pen_right += ((turn_right - 12.0) ** 2) * np.sqrt(w_turn)
+    turn_pen_left = (turn_left - 0.0) * np.sqrt(w_turn)
+    turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn)
 
     reg_terms = np.array([
         turn_pen_left,
@@ -311,13 +287,13 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
     """
     if reg_cfg is None:
         reg_cfg = {
-            'w_turn': 12.0,
-            'w_center': 4.0,
+            'w_turn': 5.0,
+            'w_center': 2.0,
             'w_curv': 3.0,
             'w_cn': 8.0,
             'w_plat': 6.0,
-            'target_b_abs': 0.2,
-            'target_b_max': 0.4,
+            'target_b_abs': 0.6,
+            'target_b_max': 0.9,
             'target_amp_max': 2.0
         }
 
@@ -347,7 +323,7 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
         amp_init = np.max(y_k_valid) - np.min(y_k_valid)
         center_init = np.median(s_k_valid)
         slope_sign = -1.0 if np.corrcoef(s_k_valid, y_k_valid)[0, 1] < 0 else 1.0
-        p0 = [amp_init, 0.3 * slope_sign, center_init, np.min(y_k_valid)]
+        p0 = [amp_init, 1.0 * slope_sign, center_init, np.min(y_k_valid)]
 
         result = least_squares(
             _sigmoid_regularized_residuals,
@@ -375,13 +351,13 @@ def train_sigmoid_only(csf_dict, stage_dict):
         s_pop,
         y_pop_norm,
         reg_cfg={
-            'w_turn': 12.0,
-            'w_center': 4.0,
+            'w_turn': 5.0,
+            'w_center': 2.0,
             'w_curv': 3.0,
             'w_cn': 10.0,
             'w_plat': 8.0,
-            'target_b_abs': 0.2,
-            'target_b_max': 0.5,
+            'target_b_abs': 0.6,
+            'target_b_max': 0.9,
             'target_amp_max': 2.0,
             's_target': -20.0,
             'y_target': y0_cn,
