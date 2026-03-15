@@ -104,15 +104,30 @@ class NeuralODE(nn.Module):
         self.net_C = make_net(2)  # [N,C]
 
 
+class FNN(nn.Module):
+    """
+    单一前向神经网络：接收 4 维输入 y=[A, T, N, C]，输出 4 维导数 dy/ds
+    """
+    def __init__(self, input_dim=4, hidden_dim=128, output_dim=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Tanh(),
+        )
+        self.output_scaler = nn.Parameter(torch.tensor([0.1]), requires_grad=True)
+
+    def forward(self, y):
+        return self.net(y) * self.output_scaler
+
+
 class ODEModel(nn.Module):
     """
     torchdiffeq 需要的 ODE 函数封装：func(t, y)
     - 仅对输入网络的 y 做[0,1]归一化（用全体数据 min/max）
-    - 用 softplus(rate) * 饱和余量 实现边界/符号约束：
-        Abeta, N: 非正且接近0时导数->0
-        Tau, C : 非负且接近1时导数->0
     """
-    def __init__(self, fnn_model: NeuralODE, y_min: torch.Tensor, y_max: torch.Tensor):
+    def __init__(self, fnn_model: FNN, y_min: torch.Tensor, y_max: torch.Tensor):
         super().__init__()
         self.fnn = fnn_model
         self.register_buffer("y_min", y_min.float())
@@ -129,24 +144,8 @@ class ODEModel(nn.Module):
             squeeze_back = True
 
         y01 = self._norm01(y)
-        A = y01[:, 0:1]
-        T = y01[:, 1:2]
-        N = y01[:, 2:3]
-        C = y01[:, 3:4]
-
-        rate_A = self.fnn.net_A(A)
-        dA = -F.softplus(rate_A) * (A + 1e-6)
-
-        rate_T = self.fnn.net_T(torch.cat([A, T], dim=1))
-        dT = F.softplus(rate_T) * (1.0 - T + 1e-6)
-
-        rate_N = self.fnn.net_N(torch.cat([T, N], dim=1))
-        dN = -F.softplus(rate_N) * (N + 1e-6)
-
-        rate_C = self.fnn.net_C(torch.cat([N, C], dim=1))
-        dC = F.softplus(rate_C) * (1.0 - C + 1e-6)
-
-        out = torch.cat([dA, dT, dN, dC], dim=1)
+        # 使用单一网络直接输出导数
+        out = self.fnn(y01)
         return out.squeeze(0) if squeeze_back else out
 
 
@@ -251,19 +250,9 @@ def adjust_sigmoid_params(sigmoid_params, y_cn_avg, y_ad_avg, s0=-20.0):
 
 def build_s_grid_from_dps(dps_params_loaded, patient_data, margin_ratio=0.1, num_points=300):
     """
-    依据预训练的DPS参数和病人时间点，构建s_grid
+    固定 s_grid 范围：从 -20 到 30，间隔 0.01
     """
-    s_all = []
-    for pid, dat in patient_data.items():
-        if pid in dps_params_loaded:
-            a = dps_params_loaded[pid]['a']
-            b = dps_params_loaded[pid]['b']
-            s_vals = a * dat['t'].numpy() + b
-            s_all.extend(s_vals)
-    s_all = np.array(s_all)
-    s_min, s_max = s_all.min(), s_all.max()
-    s_margin = (s_max - s_min) * margin_ratio
-    s_grid_np = np.linspace(s_min - s_margin, s_max + s_margin, num_points)
+    s_grid_np = np.arange(-20.0, 30.01, 0.01)
     return s_grid_np
 
 
@@ -286,7 +275,19 @@ def train_neural_ode_to_sigmoid_with_dyds(
     criterion = nn.MSELoss()
 
     s_tensor = torch.tensor(s_grid_np, dtype=torch.float32)
-    y_sigmoid, dyds_sigmoid = get_sigmoid_y_dyds_tensor(s_tensor, sigmoid_params)
+    
+    # 对s进行排序和去重，确保ODE求解器收到有效的输入
+    s_sorted, sort_idx = torch.sort(s_tensor)
+    s_unique, inverse_idx = torch.unique_consecutive(s_sorted, return_inverse=True)
+    
+    y_sigmoid_all, dyds_sigmoid_all = get_sigmoid_y_dyds_tensor(s_tensor, sigmoid_params)
+    y_sigmoid, dyds_sigmoid = get_sigmoid_y_dyds_tensor(s_unique, sigmoid_params)
+    
+    # 如果有去重或排序，需要映射回来
+    y_sigmoid_sorted = y_sigmoid_all[sort_idx]
+    dyds_sigmoid_sorted = dyds_sigmoid_all[sort_idx]
+    y_sigmoid_mapped = y_sigmoid_sorted[inverse_idx]
+    dyds_sigmoid_mapped = dyds_sigmoid_sorted[inverse_idx]
 
     # 初值选用sigmoid起点
     y0 = y_sigmoid[0]
@@ -304,13 +305,16 @@ def train_neural_ode_to_sigmoid_with_dyds(
     for epoch in range(1, epochs + 1):
         optimizer.zero_grad()
         try:
-            # 轨线预测
-            y_pred = torch_odeint(ode_model, y0, s_tensor, method='dopri5', rtol=1e-4, atol=1e-5)
-            loss_traj = criterion(y_pred, y_sigmoid)
+            # 轨线预测（使用去重后的s）
+            y_pred_unique = torch_odeint(ode_model, y0, s_unique, method='dopri5', rtol=1e-4, atol=1e-5)
+            # 映射回原始s的索引
+            y_pred = y_pred_unique[inverse_idx]
+            
+            loss_traj = criterion(y_pred, y_sigmoid_mapped)
 
             # rhs 与 A 的导数匹配
-            rhs = ode_model(torch.tensor(0.0, device=y_pred.device), y_sigmoid)
-            loss_dyds = criterion(rhs, dyds_sigmoid)
+            rhs = ode_model(torch.tensor(0.0, device=y_pred.device), y_sigmoid_mapped)
+            loss_dyds = criterion(rhs, dyds_sigmoid_mapped)
 
             loss = lambda_traj * loss_traj + lambda_dyds * loss_dyds
             loss.backward()
@@ -612,9 +616,9 @@ def train_fnn_with_fixed_dps(
 
 # --- 3. 主程序 ---
 if __name__ == '__main__':
-    # 新建 NeuralODE 模型（级联结构）
-    print("\n--- 初始化 NeuralODE 模型 ---")
-    fnn_pretrained = NeuralODE(hidden_dim=16)
+    # 新建 FNN 模型（单一网络结构）
+    print("\n--- 初始化 FNN 模型 ---")
+    fnn_pretrained = FNN(input_dim=4, hidden_dim=128, output_dim=4)
 
     # 加载sigmoid参数与DPS参数
     try:
@@ -700,9 +704,15 @@ if __name__ == '__main__':
     s_grid = torch.linspace(s_min - s_margin, s_max + s_margin, 300)
     print(f"s_grid范围: [{s_grid.min():.2f}, {s_grid.max():.2f}]")
     
+    # 对s进行排序和去重，确保ODE求解器收到有效的输入
+    s_sorted, sort_idx = torch.sort(s_grid)
+    s_unique, inverse_idx = torch.unique_consecutive(s_sorted, return_inverse=True)
+    
     with torch.no_grad():
         try:
-            y_pred = torch_odeint(final_model, y0_cn_avg, s_grid, method='dopri5', rtol=1e-4, atol=1e-5)
+            y_pred_unique = torch_odeint(final_model, y0_cn_avg, s_unique, method='dopri5', rtol=1e-4, atol=1e-5)
+            # 映射回原始s的索引
+            y_pred = y_pred_unique[inverse_idx]
             y_pred_orig = pc.inv_nor(y_pred.numpy())
         except Exception as e:
             print(f"绘图时ODE求解失败: {e}")
