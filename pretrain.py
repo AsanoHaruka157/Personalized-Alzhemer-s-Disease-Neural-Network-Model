@@ -437,6 +437,17 @@ if __name__ == '__main__':
         stage_dict
     )
 
+    # 保存DPS参数（固定版本）
+    dps_save = {
+        pid: {
+            'a': params['a'].item(),
+            'b': params['b'].item()
+        }
+        for pid, params in dps_params.items()
+    }
+    torch.save(dps_save, 'dps.pth')
+    print("已保存DPS参数到 dps.pth")
+
     # 2. 读取最优sigmoid参数
     print("读取最优sigmoid参数...")
     sigmoid_params = torch.load('sigmoid.pth', weights_only=False)

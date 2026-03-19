@@ -7,6 +7,9 @@ import numpy as np
 import pccmnn as pc
 from torchdiffeq import odeint as torch_odeint
 
+torch.set_default_dtype(torch.float64)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 # --- 0. 資料載入和準備 ---
 csf_dict = pc.load_data()
 stage_dict = pc.load_stage_dict()
@@ -15,8 +18,8 @@ print(f"成功載入 {len(csf_dict)} 位患者的資料。")
 # 转换数据格式以适应 PyTorch
 patient_data = {}
 for pid, sample in csf_dict.items():
-    t = torch.from_numpy(sample[:, 0]).float()
-    y = torch.from_numpy(sample[:, 1:5]).float()
+    t = torch.from_numpy(sample[:, 0]).to(dtype=torch.get_default_dtype(), device=device)
+    y = torch.from_numpy(sample[:, 1:5]).to(dtype=torch.get_default_dtype(), device=device)
     patient_data[pid] = {"t": t, "y": y, "y0": y[0].clone(), "stage": stage_dict.get(pid, 'Other')}
 
 def get_cn_average_y0(patient_data, stage_dict):
@@ -26,13 +29,13 @@ def get_cn_average_y0(patient_data, stage_dict):
             cn_y0s.append(data['y0'])
     if not cn_y0s:
         print("警告: 未找到CN患者, 使用預設y0。")
-        return torch.tensor([0.1, 0, 0, 0])
+        return torch.tensor([0.1, 0, 0, 0], device=device, dtype=torch.get_default_dtype())
     
     # 将所有CN患者的y0堆叠成矩阵
     cn_y0s_tensor = torch.stack(cn_y0s)  # shape: (num_cn_patients, 4)
     
     # 对每个生物标志物分别计算非NaN值的平均
-    avg_y0 = torch.zeros(4)
+    avg_y0 = torch.zeros(4, device=device, dtype=torch.get_default_dtype())
     for k in range(4):
         y0_k = cn_y0s_tensor[:, k]
         valid_mask = ~torch.isnan(y0_k)
@@ -58,8 +61,8 @@ def compute_y_minmax_01(patient_data_dict):
     for _, dat in patient_data_dict.items():
         ys.append(dat["y"])
     y_all = torch.cat(ys, dim=0)  # (N,4)
-    y_min = torch.zeros(4)
-    y_max = torch.ones(4)
+    y_min = torch.zeros(4, device=device, dtype=torch.get_default_dtype())
+    y_max = torch.ones(4, device=device, dtype=torch.get_default_dtype())
     for k in range(4):
         col = y_all[:, k]
         mask = ~torch.isnan(col)
@@ -76,34 +79,6 @@ def compute_y_minmax_01(patient_data_dict):
 y_min01, y_max01 = compute_y_minmax_01(patient_data)
 
 
-# === Neural ODE 模型定义（级联结构）===
-class NeuralODE(nn.Module):
-    """
-    级联结构的 Neural ODE，预测“速率”(rate)，由 ODEModel 乘以饱和余量实现物理约束。
-    变量顺序约定为: [Abeta, pTau, N, C]
-
-    级联依赖:
-      dA/ds  由 A 驱动
-      dT/ds  由 (A,T) 驱动
-      dN/ds  由 (T,N) 驱动
-      dC/ds  由 (N,C) 驱动
-
-    输出层 bias 初始化为 -5，使 softplus(bias)≈0，模型从“近静止”开始学习。
-    """
-    def __init__(self, hidden_dim=16):
-        super().__init__()
-        def make_net(in_dim: int):
-            fc1 = nn.Linear(in_dim, hidden_dim)
-            fc2 = nn.Linear(hidden_dim, 1)
-            nn.init.constant_(fc2.bias, -5.0)
-            return nn.Sequential(fc1, nn.ReLU(), fc2)
-
-        self.net_A = make_net(1)  # A
-        self.net_T = make_net(2)  # [A,T]
-        self.net_N = make_net(2)  # [T,N]
-        self.net_C = make_net(2)  # [N,C]
-
-
 class FNN(nn.Module):
     """
     单一前向神经网络：接收 4 维输入 y=[A, T, N, C]，输出 4 维导数 dy/ds
@@ -113,13 +88,14 @@ class FNN(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, output_dim),
             nn.Tanh(),
         )
-        self.output_scaler = nn.Parameter(torch.tensor([0.1]), requires_grad=True)
 
     def forward(self, y):
-        return self.net(y) * self.output_scaler
+        return self.net(y)
 
 
 class ODEModel(nn.Module):
@@ -130,8 +106,8 @@ class ODEModel(nn.Module):
     def __init__(self, fnn_model: FNN, y_min: torch.Tensor, y_max: torch.Tensor):
         super().__init__()
         self.fnn = fnn_model
-        self.register_buffer("y_min", y_min.float())
-        self.register_buffer("y_max", y_max.float())
+        self.register_buffer("y_min", y_min.to(dtype=torch.get_default_dtype(), device=device))
+        self.register_buffer("y_max", y_max.to(dtype=torch.get_default_dtype(), device=device))
 
     def _norm01(self, y: torch.Tensor) -> torch.Tensor:
         y01 = (y - self.y_min) / (self.y_max - self.y_min)
@@ -160,7 +136,8 @@ def get_sigmoid_values(sigmoid_params, s_grid_np):
     y_on_grid = np.zeros((len(s_grid_np), 4))
     for k in range(4):
         a, b, c, d = sigmoid_params[k]
-        y_on_grid[:, k] = a / (1.0 + np.exp(-b * (s_grid_np - c))) + d
+        exp_arg = np.clip(-b * (s_grid_np - c), -50.0, 50.0)
+        y_on_grid[:, k] = a / (1.0 + np.exp(exp_arg)) + d
     return y_on_grid
 
 
@@ -178,7 +155,7 @@ def get_sigmoid_y_dyds_tensor(s_tensor: torch.Tensor, sigmoid_params, device=Non
     """
     if device is None:
         device = s_tensor.device
-    sig = torch.tensor(sigmoid_params, dtype=torch.float32, device=device)  # (4,4)
+    sig = torch.tensor(sigmoid_params, dtype=torch.get_default_dtype(), device=device)  # (4,4)
     a = sig[:, 0].view(1, 4)
     b = sig[:, 1].view(1, 4)
     c = sig[:, 2].view(1, 4)
@@ -221,7 +198,7 @@ def adjust_sigmoid_params(sigmoid_params, y_cn_avg, y_ad_avg, s0=-20.0):
     - 下平台接近 AD 平均值
     - 在 s=s0 处穿过 y_cn_avg
     """
-    sig = np.array(sigmoid_params, dtype=np.float32)  # (4,4)
+    sig = np.array(sigmoid_params, dtype=np.float64)  # (4,4)
     adjusted = np.zeros_like(sig)
     eps = 1e-6
     for k in range(4):
@@ -244,15 +221,15 @@ def adjust_sigmoid_params(sigmoid_params, y_cn_avg, y_ad_avg, s0=-20.0):
         denom = max(denom, eps)
         c = s0 + (1.0 / b) * np.log(denom)
 
-        adjusted[k] = np.array([a, b, c, d], dtype=np.float32)
+        adjusted[k] = np.array([a, b, c, d], dtype=np.float64)
     return adjusted
 
 
-def build_s_grid_from_dps(dps_params_loaded, patient_data, margin_ratio=0.1, num_points=300):
+def build_s_grid_from_dps(dps_params_loaded, patient_data, margin_ratio=0.1, num_points=500):
     """
     固定 s_grid 范围：从 -20 到 30，间隔 0.01
     """
-    s_grid_np = np.arange(-20.0, 30.01, 0.01)
+    s_grid_np = np.arange(-20.0, 30.0, 1.0)
     return s_grid_np
 
 
@@ -262,6 +239,7 @@ def train_neural_ode_to_sigmoid_with_dyds(
     s_grid_np,
     epochs=2000,
     lr=1e-3,
+    gamma=0.997,
     lambda_traj=1.0,
     lambda_dyds=1.0,
 ):
@@ -271,23 +249,28 @@ def train_neural_ode_to_sigmoid_with_dyds(
     - 导数损失：rhs vs A(=sigmoid导数矩阵) 的L2
     """
     ode_model = ODEModel(fnn_model, y_min01, y_max01).train()
-    optimizer = optim.Adam(ode_model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    s_tensor = torch.tensor(s_grid_np, dtype=torch.float32)
-    
+    s_tensor = torch.tensor(s_grid_np, dtype=torch.get_default_dtype(), device=device)
+    fnn_model = fnn_model.to(device)
+    ode_model = ode_model.to(device)
+
     # 对s进行排序和去重，确保ODE求解器收到有效的输入
     s_sorted, sort_idx = torch.sort(s_tensor)
     s_unique, inverse_idx = torch.unique_consecutive(s_sorted, return_inverse=True)
-    
+
     y_sigmoid_all, dyds_sigmoid_all = get_sigmoid_y_dyds_tensor(s_tensor, sigmoid_params)
     y_sigmoid, dyds_sigmoid = get_sigmoid_y_dyds_tensor(s_unique, sigmoid_params)
-    
+
     # 如果有去重或排序，需要映射回来
     y_sigmoid_sorted = y_sigmoid_all[sort_idx]
     dyds_sigmoid_sorted = dyds_sigmoid_all[sort_idx]
     y_sigmoid_mapped = y_sigmoid_sorted[inverse_idx]
     dyds_sigmoid_mapped = dyds_sigmoid_sorted[inverse_idx]
+
+    # 梯度场约束的输入/目标全局固定（由sigmoid唯一决定，与训练轮次无关）
+    y_rhs_input = y_sigmoid_mapped.detach()
+    A_target = dyds_sigmoid_mapped.detach()
 
     # 初值选用sigmoid起点
     y0 = y_sigmoid[0]
@@ -302,34 +285,44 @@ def train_neural_ode_to_sigmoid_with_dyds(
     # 每10%打印一次进度
     print_interval = max(1, epochs // 10)
 
+    optimizer = optim.Adam(ode_model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+
     for epoch in range(1, epochs + 1):
+        loss_traj = torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype())
+        loss_dyds = torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype())
+
         optimizer.zero_grad()
         try:
             # 轨线预测（使用去重后的s）
             y_pred_unique = torch_odeint(ode_model, y0, s_unique, method='dopri5', rtol=1e-4, atol=1e-5)
             # 映射回原始s的索引
             y_pred = y_pred_unique[inverse_idx]
-            
+
             loss_traj = criterion(y_pred, y_sigmoid_mapped)
 
-            # rhs 与 A 的导数匹配
-            rhs = ode_model(torch.tensor(0.0, device=y_pred.device), y_sigmoid_mapped)
-            loss_dyds = criterion(rhs, dyds_sigmoid_mapped)
+            # 梯度场约束：把所有时刻的 sigmoid 状态 y(t) 输入 RHS，
+            # 拼接后计算 ||RHS - A||_2（A为sigmoid在对应时刻的导数）
+            rhs = ode_model(torch.tensor(0.0, device=y_pred.device), y_rhs_input)
+            loss_dyds = torch.norm((rhs - A_target).reshape(-1), p=2)
 
             loss = lambda_traj * loss_traj + lambda_dyds * loss_dyds
-            loss.backward()
-            optimizer.step()
-
-            loss_history['epoch'].append(epoch)
-            loss_history['traj_loss'].append(loss_traj.item())
-            loss_history['dyds_loss'].append(loss_dyds.item())
-
-            if epoch % print_interval == 0 or epoch == 1 or epoch == epochs:
-                progress = int(epoch / epochs * 100)
-                print(f"[Train {progress:3d}%] traj={loss_traj.item():.6f}, dyds={loss_dyds.item():.6f}")
+            if torch.isfinite(loss):
+                loss.backward()
+                optimizer.step()
         except Exception as e:
             print(f"ODE求解失败: {e}")
-            break
+            loss = torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype())
+
+        scheduler.step()
+
+        loss_history['epoch'].append(epoch)
+        loss_history['traj_loss'].append(float(loss_traj))
+        loss_history['dyds_loss'].append(float(loss_dyds))
+
+        if epoch % print_interval == 0 or epoch == 1 or epoch == epochs:
+            progress = int(epoch / epochs * 100)
+            print(f"[Train {progress:3d}%] traj={float(loss_traj):.6f}, dyds={float(loss_dyds):.6f}")
 
     ode_model.eval()
     return ode_model.fnn, loss_history
@@ -368,11 +361,12 @@ def calculate_loss_fnn(
                     k_list.extend([k] * valid_mask.sum().item())
 
         if not s_all_list:
-            return torch.tensor(0.0, requires_grad=True)
+            return torch.tensor(0.0, device=device, dtype=torch.get_default_dtype(), requires_grad=True)
 
         s_all = torch.cat(s_all_list)
         y_true_all = torch.cat(y_true_list)
         k_all = torch.tensor(k_list, device=y_true_all.device, dtype=torch.long)
+        y_true_all = y_true_all.to(dtype=torch.get_default_dtype())
 
         # 排序和去重操作不进计算图
         with torch.no_grad():
@@ -395,11 +389,11 @@ def calculate_loss_fnn(
         data_loss = smooth_l1_loss(y_pred_selected, y_sorted)
 
         # Sigmoid形态约束（L2到预训练Sigmoid），仅当提供了sigmoid_params
-        sigmoid_loss = torch.tensor(0.0, device=y_unique.device)
-        dyds_reg_loss = torch.tensor(0.0, device=y_unique.device)
+        sigmoid_loss = torch.tensor(0.0, device=y_unique.device, dtype=torch.get_default_dtype())
+        dyds_reg_loss = torch.tensor(0.0, device=y_unique.device, dtype=torch.get_default_dtype())
         if sigmoid_params is not None:
             # 将sigmoid参数转为tensor并放到设备上
-            sig = torch.tensor(sigmoid_params, dtype=torch.float32, device=y_unique.device)  # (4,4)
+            sig = torch.tensor(sigmoid_params, dtype=torch.get_default_dtype(), device=y_unique.device)  # (4,4)
             a = sig[:, 0].view(1, 4)  # (1,4)
             b = sig[:, 1].view(1, 4)
             c = sig[:, 2].view(1, 4)
@@ -414,7 +408,7 @@ def calculate_loss_fnn(
             with torch.no_grad():
                 s_lo = s_unique.min().item()
                 s_hi = s_unique.max().item()
-            s_sample = (torch.rand(n_dyds_samples, device=y_unique.device) * (s_hi - s_lo) + s_lo).float()
+            s_sample = (torch.rand(n_dyds_samples, device=y_unique.device, dtype=torch.get_default_dtype()) * (s_hi - s_lo) + s_lo)
             y_sig_s, dyds_sig_s = get_sigmoid_y_dyds_tensor(s_sample, sigmoid_params, device=y_unique.device)
             # 用 ode_model(t,y) 计算导数，确保同样走“输入归一化 + 饱和余量”结构
             dyds_pred = ode_model(torch.tensor(0.0, device=y_unique.device), y_sig_s)
@@ -453,14 +447,14 @@ def calculate_loss_fnn(
         if torch.isfinite(total_loss):
             return total_loss, loss_dict
         else:
-            return torch.tensor(float('inf'), requires_grad=True), loss_dict
+            return torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype(), requires_grad=True), loss_dict
 
     except Exception as e:
         print(f"FNN loss 计算出错: {e}")
         import traceback
         traceback.print_exc()
         loss_dict = {'total': float('inf'), 'data': 0, 'l1': 0, 'lambda': 0.0001}
-        return torch.tensor(float('inf'), requires_grad=True), loss_dict
+        return torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype(), requires_grad=True), loss_dict
 
 
 # ===== 优化后的 DPS 损失 =====
@@ -486,7 +480,7 @@ def calculate_loss_dps(ode_model, patient_data, ab, pids, y0):
                         k_list.append(k)
 
         if not s_all_list:
-            return torch.tensor(0.0, requires_grad=True), {'total': 0.0, 'data': 0.0, 'l2': 0.0}
+            return torch.tensor(0.0, device=device, dtype=torch.get_default_dtype(), requires_grad=True), {'total': 0.0, 'data': 0.0, 'l2': 0.0}
 
         s_all = torch.stack(s_all_list)
         y_true_all = torch.stack(y_true_list)
@@ -527,12 +521,12 @@ def calculate_loss_dps(ode_model, patient_data, ab, pids, y0):
         if torch.isfinite(total_loss):
             return total_loss, loss_dict
         else:
-            return torch.tensor(float('inf'), requires_grad=True), loss_dict
+            return torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype(), requires_grad=True), loss_dict
 
     except Exception as e:
         print(f"DPS loss 计算出错: {e}")
         loss_dict = {'total': float('inf'), 'data': 0.0, 'l2': 0.0}
-        return torch.tensor(float('inf'), requires_grad=True), loss_dict
+        return torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype(), requires_grad=True), loss_dict
 
 def train_fnn_with_fixed_dps(
     fnn_pretrained,
@@ -540,7 +534,7 @@ def train_fnn_with_fixed_dps(
     y0,
     dps_path='dps.pth',
     n_epochs=2000,
-    lr_fnn=1e-3,
+    lr_fnn=1e-2,
     sigmoid_params=None,
     lambda_traj=1.0,
     lambda_dyds=1.0,
@@ -563,8 +557,8 @@ def train_fnn_with_fixed_dps(
         for pid in patient_data.keys():
             if pid in dps_params_loaded:
                 ab[pid] = {
-                    'a': torch.tensor(dps_params_loaded[pid]['a'], dtype=torch.float32),
-                    'b': torch.tensor(dps_params_loaded[pid]['b'], dtype=torch.float32)
+                    'a': torch.tensor(dps_params_loaded[pid]['a'], dtype=torch.get_default_dtype(), device=device),
+                    'b': torch.tensor(dps_params_loaded[pid]['b'], dtype=torch.get_default_dtype(), device=device)
                 }
         print(f"成功从 {dps_path} 加载DPS参数（固定不训练）。")
     except FileNotFoundError:
@@ -618,7 +612,7 @@ def train_fnn_with_fixed_dps(
 if __name__ == '__main__':
     # 新建 FNN 模型（单一网络结构）
     print("\n--- 初始化 FNN 模型 ---")
-    fnn_pretrained = FNN(input_dim=4, hidden_dim=128, output_dim=4)
+    fnn_pretrained = FNN(input_dim=4, hidden_dim=128, output_dim=4).to(device)
 
     # 加载sigmoid参数与DPS参数
     try:
@@ -636,11 +630,9 @@ if __name__ == '__main__':
         exit()
 
     # 计算CN平均初值与AD平均值，用于调整sigmoid
-    y_cn_avg = y0_cn_avg
-    y_ad_avg = get_stage_mean_y(patient_data, 'AD', y_cn_avg)
+    y_cn_avg = y0_cn_avg.to(device)
+    y_ad_avg = get_stage_mean_y(patient_data, 'AD', y_cn_avg).to(device)
 
-    # 调整sigmoid：上平台~CN初值，下平台~AD均值，且在s=-20穿过CN初值
-    sigmoid_params = adjust_sigmoid_params(sigmoid_params, y_cn_avg, y_ad_avg, s0=-20.0)
 
     # 构建s_grid用于阶段1
     s_grid_np = build_s_grid_from_dps(dps_params_loaded, patient_data)
@@ -651,8 +643,9 @@ if __name__ == '__main__':
         fnn_pretrained,
         sigmoid_params,
         s_grid_np,
-        epochs=2000,
+        epochs=5000,
         lr=1e-3,
+        gamma=0.997,
         lambda_traj=1.0,
         lambda_dyds=1.0,
     )
@@ -660,7 +653,7 @@ if __name__ == '__main__':
     if fnn_trained is None:
         exit()
 
-    final_model = ODEModel(fnn_trained, y_min01, y_max01).eval()
+    final_model = ODEModel(fnn_trained, y_min01, y_max01).to(device).eval()
 
     # 保存训练后的模型
     torch.save(fnn_trained.state_dict(), f'{name}.pth')
@@ -690,18 +683,8 @@ if __name__ == '__main__':
     # --- 绘图 ---
     print("\n--- 生成可视化结果 ---")
     
-    # 计算实际数据的s范围
-    all_s_values = []
-    for pid, dat in patient_data.items():
-        if pid in dps_params_loaded:
-            a = float(dps_params_loaded[pid]['a'])
-            b = float(dps_params_loaded[pid]['b'])
-            s_values = a * dat['t'].numpy() + b
-            all_s_values.extend(s_values)
-    
-    s_min, s_max = np.min(all_s_values), np.max(all_s_values)
-    s_margin = (s_max - s_min) * 0.1  # 扩展10%的边距
-    s_grid = torch.linspace(s_min - s_margin, s_max + s_margin, 300)
+    # 固定可视化范围
+    s_grid = torch.arange(-20.0, 30.0 + 0.1, 0.1, device=device, dtype=torch.get_default_dtype())
     print(f"s_grid范围: [{s_grid.min():.2f}, {s_grid.max():.2f}]")
     
     # 对s进行排序和去重，确保ODE求解器收到有效的输入
@@ -739,7 +722,7 @@ if __name__ == '__main__':
                     b = float(dps_params_loaded[pid]['b'])
                     s = a * dat['t'].numpy() + b
                     y_orig = pc.inv_nor(dat['y'][:, k].numpy(), k)
-                    ax.scatter(s, y_orig, s=15, alpha=0.5, c=colors[stage])
+                    ax.scatter(s, y_orig, s=22, alpha=0.8, c=colors[stage], edgecolors='none', zorder=1)
             
             # 绘制FNN轨迹
             ax.plot(s_grid.numpy(), y_pred_orig[:, k], 'r-', lw=2.5, label='FNN Trajectory', zorder=3)
