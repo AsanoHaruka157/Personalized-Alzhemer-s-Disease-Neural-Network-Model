@@ -148,6 +148,27 @@ def get_ad_average_y(patient_data):
     return avg_y
 
 
+def get_ad_average_y_final(patient_data):
+    """
+    计算AD群体“最终一次访问”的平均生物标记物值（忽略NaN）。
+    """
+    ad_y_final = []
+    for _, data in patient_data.items():
+        if data['stage'] == 'AD' and len(data['y']) > 0:
+            ad_y_final.append(data['y'][-1])
+
+    if not ad_y_final:
+        print("警告：未找到AD患者最终值，将使用默认值 [0.0, 0.0, 0.0, 0.0]。")
+        return np.array([0.0, 0.0, 0.0, 0.0])
+
+    ad_y_final = np.array(ad_y_final)
+    avg_y_final = np.nanmean(ad_y_final, axis=0)
+    avg_y_final = np.nan_to_num(avg_y_final, nan=0.0)
+
+    print(f"计算出的AD群体平均最终值（非NaN，归一化后）: {avg_y_final}")
+    return avg_y_final
+
+
 # --- 2. Sigmoid模型（使用scipy优化 + 正则约束）---
 
 def sigmoid(s, a, b, c, d):
@@ -172,10 +193,13 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     target_b_max = reg_cfg['target_b_max']
     target_amp_max = reg_cfg['target_amp_max']
 
-    # 让曲线经过指定点 (s_target, y_target)
-    s_target = reg_cfg.get('s_target', 0.0)
-    y_target = reg_cfg.get('y_target', 0.0)
-    pass_pen = (sigmoid(s_target, a, b, c, d) - y_target) * np.sqrt(w_cn)
+    # 让曲线经过两个指定点 (s_target_1, y_target_1), (s_target_2, y_target_2)
+    s_target_1 = reg_cfg.get('s_target_1', reg_cfg.get('s_target', 0.0))
+    y_target_1 = reg_cfg.get('y_target_1', reg_cfg.get('y_target', 0.0))
+    s_target_2 = reg_cfg.get('s_target_2', 30.0)
+    y_target_2 = reg_cfg.get('y_target_2', y_target_1)
+    pass_pen_1 = (sigmoid(s_target_1, a, b, c, d) - y_target_1) * np.sqrt(w_cn)
+    pass_pen_2 = (sigmoid(s_target_2, a, b, c, d) - y_target_2) * np.sqrt(w_cn)
 
     # 上/下平台接近 CN 与 AD 平均值
     y_cn = reg_cfg.get('y_cn', 0.0)
@@ -211,7 +235,8 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
         curv_pen_low,
         curv_pen_high,
         amp_pen,
-        pass_pen,
+        pass_pen_1,
+        pass_pen_2,
         plat_pen_upper,
         plat_pen_lower
     ])
@@ -232,10 +257,13 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     target_b_abs = reg_cfg['target_b_abs']
     target_b_max = reg_cfg.get('target_b_max', 0.9)
 
-    # 让曲线经过指定点 (s_target, y_target)
-    s_target = reg_cfg.get('s_target', 0.0)
-    y_target = reg_cfg.get('y_target', 0.0)
-    pass_pen = (sigmoid(s_target, a, b, c, d) - y_target) * np.sqrt(w_cn)
+    # 让曲线经过两个指定点 (s_target_1, y_target_1), (s_target_2, y_target_2)
+    s_target_1 = reg_cfg.get('s_target_1', reg_cfg.get('s_target', 0.0))
+    y_target_1 = reg_cfg.get('y_target_1', reg_cfg.get('y_target', 0.0))
+    s_target_2 = reg_cfg.get('s_target_2', 20.0)
+    y_target_2 = reg_cfg.get('y_target_2', y_target_1)
+    pass_pen_1 = (sigmoid(s_target_1, a, b, c, d) - y_target_1) * np.sqrt(w_cn)
+    pass_pen_2 = (sigmoid(s_target_2, a, b, c, d) - y_target_2) * np.sqrt(w_cn)
 
     # 上/下平台接近 CN 与 AD 平均值
     y_cn = reg_cfg.get('y_cn', 0.0)
@@ -267,7 +295,8 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
         center_high,
         curv_pen_low,
         curv_pen_high,
-        pass_pen,
+        pass_pen_1,
+        pass_pen_2,
         plat_pen_upper,
         plat_pen_lower
     ])
@@ -289,13 +318,18 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
         reg_cfg = {
             'w_turn': 5.0,
             'w_center': 2.0,
-            'w_curv': 3.0,
+            'w_curv': 5.0,
             'w_cn': 8.0,
             'w_plat': 6.0,
-            'target_b_abs': 0.6,
-            'target_b_max': 0.9,
-            'target_amp_max': 2.0
+            'target_b_abs': 0.9,
+            'target_b_max': 1.2,
+            'target_amp_max': 4.0
         }
+
+    def _tau_bc_residuals(x_bc, s_valid, y_valid, reg_cfg_k, fixed_a, fixed_d):
+        b, c = x_bc
+        params = np.array([fixed_a, b, c, fixed_d], dtype=np.float64)
+        return _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg_k)
 
     sigmoid_params = []
     total_loss = 0.0
@@ -310,9 +344,13 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
         y_ad = reg_cfg.get('y_ad', 0.0)
         reg_cfg_k['y_cn'] = y_cn[k] if isinstance(y_cn, (list, np.ndarray)) else y_cn
         reg_cfg_k['y_ad'] = y_ad[k] if isinstance(y_ad, (list, np.ndarray)) else y_ad
-        y_target = reg_cfg.get('y_target', 0.0)
-        reg_cfg_k['y_target'] = y_target[k] if isinstance(y_target, (list, np.ndarray)) else y_target
-        reg_cfg_k['s_target'] = reg_cfg.get('s_target', -20.0)
+        y_target_1 = reg_cfg.get('y_target_1', reg_cfg.get('y_target', 0.0))
+        reg_cfg_k['y_target_1'] = y_target_1[k] if isinstance(y_target_1, (list, np.ndarray)) else y_target_1
+        reg_cfg_k['s_target_1'] = reg_cfg.get('s_target_1', reg_cfg.get('s_target', -20.0))
+
+        y_target_2 = reg_cfg.get('y_target_2', y_ad)
+        reg_cfg_k['y_target_2'] = y_target_2[k] if isinstance(y_target_2, (list, np.ndarray)) else y_target_2
+        reg_cfg_k['s_target_2'] = reg_cfg.get('s_target_2', 20.0)
 
         if len(y_k_valid) < 5:
             default_params = np.array([1.0, 1.0, 5.0, 0.0])
@@ -323,16 +361,35 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
         amp_init = np.max(y_k_valid) - np.min(y_k_valid)
         center_init = np.median(s_k_valid)
         slope_sign = -1.0 if np.corrcoef(s_k_valid, y_k_valid)[0, 1] < 0 else 1.0
-        p0 = [amp_init, 1.0 * slope_sign, center_init, np.min(y_k_valid)]
 
-        result = least_squares(
-            _sigmoid_regularized_residuals,
-            x0=p0,
-            args=(s_k_valid, y_k_valid, reg_cfg_k),
-            max_nfev=10000
-        )
-        sigmoid_params.append(result.x)
-        total_loss += _sigmoid_fit_loss(result.x, s_k_valid, y_k_valid, reg_cfg_k)
+        # Tau(k=1) 特殊约束：固定上下平台，仅优化 b,c
+        if k == 1 and reg_cfg.get('tau_fix_platform', False):
+            tau_upper = float(reg_cfg.get('tau_upper_norm', 1.0))
+            tau_lower = float(reg_cfg.get('tau_lower_norm', 0.0))
+            fixed_d = tau_lower
+            fixed_a = tau_upper - tau_lower
+
+            x0_bc = [1.0 * slope_sign, center_init]
+            result = least_squares(
+                _tau_bc_residuals,
+                x0=x0_bc,
+                args=(s_k_valid, y_k_valid, reg_cfg_k, fixed_a, fixed_d),
+                max_nfev=10000
+            )
+            b_opt, c_opt = result.x
+            params_opt = np.array([fixed_a, b_opt, c_opt, fixed_d], dtype=np.float64)
+        else:
+            p0 = [amp_init, 1.0 * slope_sign, center_init, np.min(y_k_valid)]
+            result = least_squares(
+                _sigmoid_regularized_residuals,
+                x0=p0,
+                args=(s_k_valid, y_k_valid, reg_cfg_k),
+                max_nfev=10000
+            )
+            params_opt = result.x
+
+        sigmoid_params.append(params_opt)
+        total_loss += _sigmoid_fit_loss(params_opt, s_k_valid, y_k_valid, reg_cfg_k)
 
     return np.array(sigmoid_params), float(total_loss)
 
@@ -346,6 +403,22 @@ def train_sigmoid_only(csf_dict, stage_dict):
     patient_data, s_pop, y_pop_norm, _ = compute_s_values(csf_dict, dps_params)
     y0_cn = get_cn_average_y0(patient_data)
     y_ad = get_ad_average_y(patient_data)
+    y_ad_final = get_ad_average_y_final(patient_data)
+
+    # Tau(k=1) 特殊约束：固定上下平台（原空间）并转到归一化空间
+    mean_std = np.load('mean_std.npy')
+    tau_mean = float(mean_std[0, 1])
+    tau_std = float(mean_std[1, 1])
+    tau_lower_norm = (70.0 - tau_mean) / tau_std
+    tau_upper_norm = (130.0 - tau_mean) / tau_std
+
+    y_target_1 = np.array(y0_cn, copy=True)
+    y_target_2 = np.array(y_ad_final, copy=True)
+    y_target_1[1] = tau_lower_norm   # s=-20 对应下平台
+    y_target_2[1] = tau_upper_norm   # s=30 对应上平台
+
+    print(f"Tau平台固定(原空间): lower=70, upper=130")
+    print(f"Tau平台固定(归一化): lower={tau_lower_norm:.6f}, upper={tau_upper_norm:.6f}")
 
     sigmoid_params, sigmoid_loss = fit_sigmoids_regularized(
         s_pop,
@@ -359,8 +432,13 @@ def train_sigmoid_only(csf_dict, stage_dict):
             'target_b_abs': 0.6,
             'target_b_max': 0.9,
             'target_amp_max': 2.0,
-            's_target': -20.0,
-            'y_target': y0_cn,
+            's_target_1': -20.0,
+            'y_target_1': y_target_1,
+            's_target_2': 30.0,
+            'y_target_2': y_target_2,
+            'tau_fix_platform': True,
+            'tau_lower_norm': tau_lower_norm,
+            'tau_upper_norm': tau_upper_norm,
             'y_cn': y0_cn,
             'y_ad': y_ad
         }
@@ -424,7 +502,7 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params):
 
     fig.suptitle('AD Biomarker Trajectories: Sigmoid Fit', fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig('pretrain.png')
+    plt.savefig('sigmoid.png')
     plt.show()
 
 

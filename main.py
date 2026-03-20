@@ -50,7 +50,22 @@ def get_cn_average_y0(patient_data, stage_dict):
     return avg_y0
 
 y0_cn_avg = get_cn_average_y0(patient_data, stage_dict)
-name = 'fnn'
+
+# ===== 全局超参数（主程序训练） =====
+PRETRAIN_EPOCHS = 5000
+PRETRAIN_LR = 1e-2
+PRETRAIN_GAMMA = 0.999
+LAMBDA_TRAJ = 1.0
+LAMBDA_DYDS = 1.0           # 保留梯度场loss超参数（可选）
+LAMBDA_DATA_L2 = 1e-2        # 误差方差倒数加权的 data L2 loss 权重
+INV_VAR_EPS = 1e-8
+USE_TRAJ_LOSS = True        # 主程序是否启用 trajectory loss
+USE_GRADIENT_LOSS = False   # 主程序是否启用 gradient loss
+USE_DATA_L2_LOSS = True    # 主程序是否启用 data l2 loss
+FIGURE_PATH = 'main.png'
+LOSS_PATH = 'main_loss.png'
+MODEL_PATH = 'main.pt'
+
 
 def compute_y_minmax_01(patient_data_dict):
     """
@@ -241,12 +256,18 @@ def train_neural_ode_to_sigmoid_with_dyds(
     lr=1e-3,
     gamma=0.997,
     lambda_traj=1.0,
-    lambda_dyds=1.0,
+    lambda_dyds=1e-3,
+    lambda_data_l2=1.0,
+    inv_var_eps=1e-8,
+    use_traj_loss=True,
+    use_gradient_loss=True,
+    use_data_l2_loss=True,
 ):
     """
     训练 Neural ODE：
     - 轨线损失：ODE预测轨线 vs sigmoid曲线的L2
-    - 导数损失：rhs vs A(=sigmoid导数矩阵) 的L2
+    - （可选）数据L2损失：误差方差倒数加权的L2
+    - （可选）导数损失：rhs vs A(=sigmoid导数矩阵) 的L2
     """
     ode_model = ODEModel(fnn_model, y_min01, y_max01).train()
     criterion = nn.MSELoss()
@@ -279,6 +300,7 @@ def train_neural_ode_to_sigmoid_with_dyds(
     loss_history = {
         'epoch': [],
         'traj_loss': [],
+        'data_l2_loss': [],
         'dyds_loss': []
     }
 
@@ -289,8 +311,9 @@ def train_neural_ode_to_sigmoid_with_dyds(
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 
     for epoch in range(1, epochs + 1):
-        loss_traj = torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype())
-        loss_dyds = torch.tensor(float('inf'), device=device, dtype=torch.get_default_dtype())
+        loss_traj = torch.tensor(0.0, device=device, dtype=torch.get_default_dtype())
+        loss_data_l2 = torch.tensor(0.0, device=device, dtype=torch.get_default_dtype())
+        loss_dyds = torch.tensor(0.0, device=device, dtype=torch.get_default_dtype())
 
         optimizer.zero_grad()
         try:
@@ -299,14 +322,22 @@ def train_neural_ode_to_sigmoid_with_dyds(
             # 映射回原始s的索引
             y_pred = y_pred_unique[inverse_idx]
 
-            loss_traj = criterion(y_pred, y_sigmoid_mapped)
+            if use_traj_loss:
+                loss_traj = criterion(y_pred, y_sigmoid_mapped)
 
-            # 梯度场约束：把所有时刻的 sigmoid 状态 y(t) 输入 RHS，
-            # 拼接后计算 ||RHS - A||_2（A为sigmoid在对应时刻的导数）
-            rhs = ode_model(torch.tensor(0.0, device=y_pred.device), y_rhs_input)
-            loss_dyds = torch.norm((rhs - A_target).reshape(-1), p=2)
+            # 误差方差倒数加权 data L2 loss（代码保留，可选启用）
+            if use_data_l2_loss:
+                err = y_pred - y_sigmoid_mapped  # (N,4)
+                err_var = torch.var(err, dim=0, unbiased=False)  # (4,)
+                inv_var = 1.0 / (err_var + inv_var_eps)          # (4,)
+                loss_data_l2 = torch.mean((err ** 2) * inv_var.view(1, -1))
 
-            loss = lambda_traj * loss_traj + lambda_dyds * loss_dyds
+            # 梯度场约束（代码保留，可选启用）
+            if use_gradient_loss:
+                rhs = ode_model(torch.tensor(0.0, device=y_pred.device), y_rhs_input)
+                loss_dyds = torch.norm((rhs - A_target).reshape(-1), p=2)
+
+            loss = lambda_traj * loss_traj + lambda_data_l2 * loss_data_l2 + lambda_dyds * loss_dyds
             if torch.isfinite(loss):
                 loss.backward()
                 optimizer.step()
@@ -318,11 +349,15 @@ def train_neural_ode_to_sigmoid_with_dyds(
 
         loss_history['epoch'].append(epoch)
         loss_history['traj_loss'].append(float(loss_traj))
+        loss_history['data_l2_loss'].append(float(loss_data_l2))
         loss_history['dyds_loss'].append(float(loss_dyds))
 
         if epoch % print_interval == 0 or epoch == 1 or epoch == epochs:
             progress = int(epoch / epochs * 100)
-            print(f"[Train {progress:3d}%] traj={float(loss_traj):.6f}, dyds={float(loss_dyds):.6f}")
+            print(
+                f"[Train {progress:3d}%] traj={float(loss_traj):.6f}, "
+                f"data_l2={float(loss_data_l2):.6f}, dyds={float(loss_dyds):.6f}"
+            )
 
     ode_model.eval()
     return ode_model.fnn, loss_history
@@ -614,6 +649,14 @@ if __name__ == '__main__':
     print("\n--- 初始化 FNN 模型 ---")
     fnn_pretrained = FNN(input_dim=4, hidden_dim=128, output_dim=4).to(device)
 
+    # 加载预训练模型参数
+    try:
+        fnn_pretrained.load_state_dict(torch.load('pretrain.pth', map_location=device, weights_only=False))
+        print("成功加载 pretrain.pth")
+    except FileNotFoundError:
+        print("错误: 未找到 pretrain.pth，请先运行 pretrain.py")
+        exit()
+
     # 加载sigmoid参数与DPS参数
     try:
         sigmoid_params = torch.load('sigmoid.pth', weights_only=False)
@@ -637,17 +680,22 @@ if __name__ == '__main__':
     # 构建s_grid用于阶段1
     s_grid_np = build_s_grid_from_dps(dps_params_loaded, patient_data)
 
-    # 训练：Sigmoid轨线 + 导数约束
-    print("\n--- 训练：Sigmoid轨线 + 导数约束 ---")
+    # 训练：Sigmoid轨线（data L2 / gradient loss 可按超参数开关）
+    print("\n--- 训练：Sigmoid轨线 ---")
     fnn_trained, loss_history = train_neural_ode_to_sigmoid_with_dyds(
         fnn_pretrained,
         sigmoid_params,
         s_grid_np,
-        epochs=5000,
-        lr=1e-3,
-        gamma=0.997,
-        lambda_traj=1.0,
-        lambda_dyds=1.0,
+        epochs=PRETRAIN_EPOCHS,
+        lr=PRETRAIN_LR,
+        gamma=PRETRAIN_GAMMA,
+        lambda_traj=LAMBDA_TRAJ,
+        lambda_dyds=LAMBDA_DYDS,
+        lambda_data_l2=LAMBDA_DATA_L2,
+        inv_var_eps=INV_VAR_EPS,
+        use_traj_loss=USE_TRAJ_LOSS,
+        use_gradient_loss=USE_GRADIENT_LOSS,
+        use_data_l2_loss=USE_DATA_L2_LOSS,
     )
 
     if fnn_trained is None:
@@ -656,29 +704,41 @@ if __name__ == '__main__':
     final_model = ODEModel(fnn_trained, y_min01, y_max01).to(device).eval()
 
     # 保存训练后的模型
-    torch.save(fnn_trained.state_dict(), f'{name}.pth')
-    print(f"\n模型已保存到 {name}.pth")
+    torch.save(fnn_trained.state_dict(), MODEL_PATH)
+    print(f"\n模型已保存到 {MODEL_PATH}")
     
     # --- 绘制损失曲线 ---
     print("\n--- 绘制损失曲线 ---")
-    fig_loss, ax = plt.subplots(1, 1, figsize=(8, 5))
-    
     steps = list(range(len(loss_history['traj_loss'])))
-    
-    ax.plot(steps, loss_history['traj_loss'], 'b-', linewidth=2, alpha=0.7, label='Trajectory L2')
-    ax.plot(steps, loss_history['dyds_loss'], 'r-', linewidth=2, alpha=0.7, label='RHS L2')
-    ax.set_xlabel('Epoch', fontsize=12)
-    ax.set_ylabel('Loss', fontsize=12)
-    ax.set_title('Loss Curve', fontsize=14)
-    ax.grid(True, alpha=0.3)
-    ax.set_yscale('log')
-    ax.legend()
-    
-    plt.tight_layout()
-    loss_curve_filename = f'{name}_loss_curve.png'
-    plt.savefig(loss_curve_filename)
-    print(f"损失曲线已保存到 {loss_curve_filename}")
-    plt.show()
+
+    plot_items = []
+    if USE_TRAJ_LOSS:
+        plot_items.append(('traj_loss', 'Trajectory L2', 'b-'))
+    if USE_DATA_L2_LOSS:
+        plot_items.append(('data_l2_loss', 'Inv-Var Weighted Data L2', 'g-'))
+    if USE_GRADIENT_LOSS:
+        plot_items.append(('dyds_loss', 'RHS L2 (optional)', 'r-'))
+
+    if len(plot_items) > 0:
+        fig_loss, axes = plt.subplots(len(plot_items), 1, figsize=(8, 4 * len(plot_items)), squeeze=False)
+        axes = axes.flatten()
+
+        for i, (key, title, style) in enumerate(plot_items):
+            ax = axes[i]
+            ax.plot(steps, loss_history[key], style, linewidth=2, alpha=0.8)
+            ax.set_xlabel('Epoch', fontsize=12)
+            ax.set_ylabel('Loss', fontsize=12)
+            ax.set_title(title, fontsize=13)
+            ax.grid(True, alpha=0.3)
+            ax.set_yscale('log')
+
+        plt.tight_layout()
+        loss_curve_filename = f'{LOSS_PATH}'
+        plt.savefig(loss_curve_filename)
+        print(f"损失曲线已保存到 {LOSS_PATH}.png")
+        plt.show()
+    else:
+        print("所有loss绘图开关均为False，跳过损失曲线绘制。")
     
     # --- 绘图 ---
     print("\n--- 生成可视化结果 ---")
@@ -693,7 +753,11 @@ if __name__ == '__main__':
     
     with torch.no_grad():
         try:
-            y_pred_unique = torch_odeint(final_model, y0_cn_avg, s_unique, method='dopri5', rtol=1e-4, atol=1e-5)
+            # 使用 sigmoid 起点作为初值（与 pretrain 一致）
+            y_sigmoid_plot, _ = get_sigmoid_y_dyds_tensor(s_unique, sigmoid_params, device=device)
+            y0_plot = y_sigmoid_plot[0]
+
+            y_pred_unique = torch_odeint(final_model, y0_plot, s_unique, method='dopri5', rtol=1e-4, atol=1e-5)
             # 映射回原始s的索引
             y_pred = y_pred_unique[inverse_idx]
             y_pred_orig = pc.inv_nor(y_pred.numpy())
@@ -742,8 +806,8 @@ if __name__ == '__main__':
         
         fig.suptitle('FNN Model (Fixed DPS) with Sigmoid Constraints', fontsize=16)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(f'{name}.png')
-        print(f"结果图已保存到 {name}.png")
+        plt.savefig(f'{FIGURE_PATH}')
+        print(f"结果图已保存到 {FIGURE_PATH}")
         plt.show()
 
     print("\n完整流程执行完毕。")
