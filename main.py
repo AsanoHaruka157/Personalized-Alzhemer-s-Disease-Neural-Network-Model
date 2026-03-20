@@ -206,40 +206,6 @@ def get_stage_mean_y(patient_data, stage, fallback_tensor):
     return mean_y
 
 
-def adjust_sigmoid_params(sigmoid_params, y_cn_avg, y_ad_avg, s0=-20.0):
-    """
-    调整sigmoid参数，使：
-    - 上平台接近 CN 平均初值
-    - 下平台接近 AD 平均值
-    - 在 s=s0 处穿过 y_cn_avg
-    """
-    sig = np.array(sigmoid_params, dtype=np.float64)  # (4,4)
-    adjusted = np.zeros_like(sig)
-    eps = 1e-6
-    for k in range(4):
-        b_orig = float(sig[k, 1])
-        b = max(abs(b_orig), 0.05)
-
-        upper = float(y_cn_avg[k])
-        lower = float(y_ad_avg[k])
-        a = upper - lower
-        d = lower
-
-        # 确保 y0(=CN初值) 在平台区间内
-        y0 = float(y_cn_avg[k])
-        lo = min(lower, upper) + eps
-        hi = max(lower, upper) - eps
-        y0 = float(np.clip(y0, lo, hi))
-
-        # 计算 c，使 y(s0)=y0
-        denom = (a / (y0 - d)) - 1.0
-        denom = max(denom, eps)
-        c = s0 + (1.0 / b) * np.log(denom)
-
-        adjusted[k] = np.array([a, b, c, d], dtype=np.float64)
-    return adjusted
-
-
 def build_s_grid_from_dps(dps_params_loaded, patient_data, margin_ratio=0.1, num_points=500):
     """
     固定 s_grid 范围：从 -20 到 30，间隔 0.01

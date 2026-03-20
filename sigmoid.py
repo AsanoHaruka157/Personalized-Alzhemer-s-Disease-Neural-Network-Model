@@ -206,7 +206,8 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     y_ad = reg_cfg.get('y_ad', 0.0)
     upper = np.maximum(d, d + a)
     lower = np.minimum(d, d + a)
-    plat_pen_upper = (upper - y_cn) * np.sqrt(w_plat)
+    use_plat_upper = reg_cfg.get('use_plat_upper', True)
+    plat_pen_upper = (upper - y_cn) * np.sqrt(w_plat) if use_plat_upper else 0.0
     plat_pen_lower = (lower - y_ad) * np.sqrt(w_plat)
 
     # 中心点在[0,10]内
@@ -224,8 +225,9 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     b_safe = b if np.abs(b) > 1e-6 else 1e-6
     turn_left = c - (np.log(2.0) / b_safe)
     turn_right = c + (np.log(2.0) / b_safe)
+    use_turn_right = reg_cfg.get('use_turn_right', True)
     turn_pen_left = (turn_left - 0.0) * np.sqrt(w_turn)
-    turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn)
+    turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn) if use_turn_right else 0.0
 
     reg_terms = np.array([
         turn_pen_left,
@@ -270,7 +272,8 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     y_ad = reg_cfg.get('y_ad', 0.0)
     upper = np.maximum(d, d + a)
     lower = np.minimum(d, d + a)
-    plat_pen_upper = (upper - y_cn) * np.sqrt(w_plat)
+    use_plat_upper = reg_cfg.get('use_plat_upper', True)
+    plat_pen_upper = (upper - y_cn) * np.sqrt(w_plat) if use_plat_upper else 0.0
     plat_pen_lower = (lower - y_ad) * np.sqrt(w_plat)
 
     # 中心点在[0,10]内
@@ -285,8 +288,9 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     b_safe = b if np.abs(b) > 1e-6 else 1e-6
     turn_left = c - (np.log(2.0) / b_safe)
     turn_right = c + (np.log(2.0) / b_safe)
+    use_turn_right = reg_cfg.get('use_turn_right', True)
     turn_pen_left = (turn_left - 0.0) * np.sqrt(w_turn)
-    turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn)
+    turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn) if use_turn_right else 0.0
 
     reg_terms = np.array([
         turn_pen_left,
@@ -314,6 +318,11 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
     5) 通过指定点 (s_target, y_target)
     6) 上/下平台接近 CN/AD 平均值
     """
+    def _tau_bc_residuals(x_bc, s_valid, y_valid, reg_cfg_k, fixed_a, fixed_d):
+        b, c = x_bc
+        params = np.array([fixed_a, b, c, fixed_d], dtype=np.float64)
+        return _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg_k)
+
     if reg_cfg is None:
         reg_cfg = {
             'w_turn': 5.0,
@@ -325,11 +334,6 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
             'target_b_max': 1.2,
             'target_amp_max': 4.0
         }
-
-    def _tau_bc_residuals(x_bc, s_valid, y_valid, reg_cfg_k, fixed_a, fixed_d):
-        b, c = x_bc
-        params = np.array([fixed_a, b, c, fixed_d], dtype=np.float64)
-        return _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg_k)
 
     sigmoid_params = []
     total_loss = 0.0
@@ -352,6 +356,17 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
         reg_cfg_k['y_target_2'] = y_target_2[k] if isinstance(y_target_2, (list, np.ndarray)) else y_target_2
         reg_cfg_k['s_target_2'] = reg_cfg.get('s_target_2', 20.0)
 
+        # Tau(k=1): 固定上下平台，仅优化 b,c，并使用指定曲率约束
+        if k == 1:
+            reg_cfg_k['target_b_abs'] = 2.5
+            reg_cfg_k['target_b_max'] = 3.0
+            reg_cfg_k['w_curv'] = 100
+
+        # C(k=3): 不做上平台约束，也不做右拐点约束
+        if k == 3:
+            reg_cfg_k['use_plat_upper'] = False
+            reg_cfg_k['use_turn_right'] = False
+
         if len(y_k_valid) < 5:
             default_params = np.array([1.0, 1.0, 5.0, 0.0])
             sigmoid_params.append(default_params)
@@ -362,7 +377,6 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
         center_init = np.median(s_k_valid)
         slope_sign = -1.0 if np.corrcoef(s_k_valid, y_k_valid)[0, 1] < 0 else 1.0
 
-        # Tau(k=1) 特殊约束：固定上下平台，仅优化 b,c
         if k == 1 and reg_cfg.get('tau_fix_platform', False):
             tau_upper = float(reg_cfg.get('tau_upper_norm', 1.0))
             tau_lower = float(reg_cfg.get('tau_lower_norm', 0.0))
@@ -405,7 +419,7 @@ def train_sigmoid_only(csf_dict, stage_dict):
     y_ad = get_ad_average_y(patient_data)
     y_ad_final = get_ad_average_y_final(patient_data)
 
-    # Tau(k=1) 特殊约束：固定上下平台（原空间）并转到归一化空间
+    # Tau约束：固定上下平台 a+d=130, d=70（先转归一化）
     mean_std = np.load('mean_std.npy')
     tau_mean = float(mean_std[0, 1])
     tau_std = float(mean_std[1, 1])
@@ -414,11 +428,11 @@ def train_sigmoid_only(csf_dict, stage_dict):
 
     y_target_1 = np.array(y0_cn, copy=True)
     y_target_2 = np.array(y_ad_final, copy=True)
-    y_target_1[1] = tau_lower_norm   # s=-20 对应下平台
-    y_target_2[1] = tau_upper_norm   # s=30 对应上平台
+    y_target_1[1] = tau_lower_norm
+    y_target_2[1] = tau_upper_norm
 
-    print(f"Tau平台固定(原空间): lower=70, upper=130")
-    print(f"Tau平台固定(归一化): lower={tau_lower_norm:.6f}, upper={tau_upper_norm:.6f}")
+    print("Tau固定平台(原空间): d=70, a+d=130")
+    print(f"Tau固定平台(归一化): d={tau_lower_norm:.6f}, a+d={tau_upper_norm:.6f}")
 
     sigmoid_params, sigmoid_loss = fit_sigmoids_regularized(
         s_pop,
