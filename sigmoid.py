@@ -310,13 +310,9 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
 
 def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
     """
-    为4个biomarker拟合sigmoid函数，正则约束：
-    1) 两个拐点在0、10附近
-    2) 中心点在0~10之间
-    3) 曲率更大（|b|更大）
-    4) 幅度不要过大
-    5) 通过指定点 (s_target, y_target)
-    6) 上/下平台接近 CN/AD 平均值
+    拟合4个biomarker轨迹：
+    - k=0,1,2 使用 sigmoid + 正则约束
+    - k=3 (C) 使用二次函数（无额外正则）
     """
     def _tau_bc_residuals(x_bc, s_valid, y_valid, reg_cfg_k, fixed_a, fixed_d):
         b, c = x_bc
@@ -371,6 +367,24 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
             default_params = np.array([1.0, 1.0, 5.0, 0.0])
             sigmoid_params.append(default_params)
             total_loss += _sigmoid_fit_loss(default_params, s_k_valid, y_k_valid, reg_cfg_k)
+            continue
+
+        # C(k=3): 使用 y = a*(s-b)^2 + c，其中 b 固定、c 固定，只优化 a
+        if k == 3:
+            b_fixed = float(reg_cfg.get('c_quad_b_fixed', -10.0))
+            c_fixed = float(reg_cfg.get('c_quad_c_fixed', reg_cfg_k.get('y_cn', 0.0)))
+
+            x = (s_k_valid - b_fixed) ** 2
+            y_shift = y_k_valid - c_fixed
+            denom = np.sum(x * x)
+            a_opt = 0.0 if denom < 1e-12 else float(np.sum(x * y_shift) / denom)
+
+            # 用 [a,b,c,d] 容器回传：约定 a->a_opt, b->b_fixed, c->c_fixed, d->NaN
+            params_opt = np.array([a_opt, b_fixed, c_fixed, np.nan], dtype=np.float64)
+
+            y_pred_quad = a_opt * ((s_k_valid - b_fixed) ** 2) + c_fixed
+            total_loss += float(np.mean((y_pred_quad - y_k_valid) ** 2))
+            sigmoid_params.append(params_opt)
             continue
 
         amp_init = np.max(y_k_valid) - np.min(y_k_valid)
@@ -453,6 +467,8 @@ def train_sigmoid_only(csf_dict, stage_dict):
             'tau_fix_platform': True,
             'tau_lower_norm': tau_lower_norm,
             'tau_upper_norm': tau_upper_norm,
+            'c_quad_b_fixed': -10.0,
+            'c_quad_c_fixed': float(y0_cn[3]),
             'y_cn': y0_cn,
             'y_ad': y_ad
         }
@@ -471,6 +487,14 @@ def get_sigmoid_derivatives(s_grid, params):
 
     for k in range(4):
         a, b, c, d = params[k]
+
+        # C(k=3) 使用二次函数：y = a*(s-b)^2 + c（约定 d 为 NaN）
+        if k == 3 and np.isnan(d):
+            a_quad, b_quad, c_quad = a, b, c
+            y_on_grid[:, k] = a_quad * ((s_grid - b_quad) ** 2) + c_quad
+            dyds_on_grid[:, k] = 2.0 * a_quad * (s_grid - b_quad)
+            continue
+
         exp_arg = np.clip(-b * (s_grid - c), -50.0, 50.0)
         exp_term = np.exp(exp_arg)
         denom = (1.0 + exp_term) ** 2
