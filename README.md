@@ -132,6 +132,12 @@ pip install torch torchdiffeq pandas numpy matplotlib scipy openpyxl
 - **Sensitivity analysis:** The script for computing `sensitive_params.json` is not yet included in this repository.
 - **Model weight files:** `fpp.pth` and `dps_fpp.pth` (used by `personalized.py`) are produced by a separate experimental run not yet integrated.
 
+## Data Availability
+
+NACC data is available at [https://www.naccdata.org/](https://www.naccdata.org/).
+
 ## References
 
 See `docs/` for the accompanying manuscript and supplementary notes.
+
+**Citation:** Zheng, H., Petrella, J.R., Doraiswamy, P.M. *et al.* Data-driven causal model discovery and personalized prediction in Alzheimer's disease. *npj Digit. Med.* **5**, 137 (2022). [https://doi.org/10.1038/s41746-022-00632-7](https://doi.org/10.1038/s41746-022-00632-7)
