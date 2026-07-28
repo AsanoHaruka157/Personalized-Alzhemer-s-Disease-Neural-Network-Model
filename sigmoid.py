@@ -369,23 +369,6 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
             total_loss += _sigmoid_fit_loss(default_params, s_k_valid, y_k_valid, reg_cfg_k)
             continue
 
-        # C(k=3): 使用 y = a*(s-b)^2 + c，其中 b 固定、c 固定，只优化 a
-        if k == 3:
-            b_fixed = float(reg_cfg.get('c_quad_b_fixed', -10.0))
-            c_fixed = float(reg_cfg.get('c_quad_c_fixed', reg_cfg_k.get('y_cn', 0.0)))
-
-            x = (s_k_valid - b_fixed) ** 2
-            y_shift = y_k_valid - c_fixed
-            denom = np.sum(x * x)
-            a_opt = 0.0 if denom < 1e-12 else float(np.sum(x * y_shift) / denom)
-
-            # 用 [a,b,c,d] 容器回传：约定 a->a_opt, b->b_fixed, c->c_fixed, d->NaN
-            params_opt = np.array([a_opt, b_fixed, c_fixed, np.nan], dtype=np.float64)
-
-            y_pred_quad = a_opt * ((s_k_valid - b_fixed) ** 2) + c_fixed
-            total_loss += float(np.mean((y_pred_quad - y_k_valid) ** 2))
-            sigmoid_params.append(params_opt)
-            continue
 
         amp_init = np.max(y_k_valid) - np.min(y_k_valid)
         center_init = np.median(s_k_valid)
@@ -488,12 +471,6 @@ def get_sigmoid_derivatives(s_grid, params):
     for k in range(4):
         a, b, c, d = params[k]
 
-        # C(k=3) 使用二次函数：y = a*(s-b)^2 + c（约定 d 为 NaN）
-        if k == 3 and np.isnan(d):
-            a_quad, b_quad, c_quad = a, b, c
-            y_on_grid[:, k] = a_quad * ((s_grid - b_quad) ** 2) + c_quad
-            dyds_on_grid[:, k] = 2.0 * a_quad * (s_grid - b_quad)
-            continue
 
         exp_arg = np.clip(-b * (s_grid - c), -50.0, 50.0)
         exp_term = np.exp(exp_arg)

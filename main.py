@@ -53,7 +53,7 @@ y0_cn_avg = get_cn_average_y0(patient_data, stage_dict)
 
 # ===== 全局超参数（主程序训练） =====
 PRETRAIN_EPOCHS = 5000
-PRETRAIN_LR = 1e-2
+PRETRAIN_LR = 1e-3
 PRETRAIN_GAMMA = 0.999
 LAMBDA_TRAJ = 1.0
 LAMBDA_DYDS = 1.0           # 保留梯度场loss超参数（可选）
@@ -141,46 +141,58 @@ class ODEModel(nn.Module):
 
 
 # === Sigmoid辅助函数 ===
-def get_sigmoid_values(sigmoid_params, s_grid_np):
+def get_sigmoid_values(sigmoid_params, s_grid_np, force_sigmoid_for_c=True):
     """
-    根据sigmoid参数计算在s_grid上的函数值
-    sigmoid_params: shape (4,4) -> [a,b,c,d] for each biomarker
-    s_grid_np: numpy array
-    return: numpy array (len(s_grid), 4)
+    根据参数计算在s_grid上的函数值。
+    说明：即使 C(k=3) 在 sigmoid.py 中可能已不是 sigmoid，
+    这里仍可通过 force_sigmoid_for_c=True 强制按 sigmoid 计算，
+    用于主程序中的“sigmoid正则化约束”。
     """
     y_on_grid = np.zeros((len(s_grid_np), 4))
     for k in range(4):
         a, b, c, d = sigmoid_params[k]
+        if k == 3 and (not np.isfinite(d)) and (not force_sigmoid_for_c):
+            # C 的非sigmoid参数（例如二次函数）可在非正则场景下走专用分支
+            y_on_grid[:, k] = a * ((s_grid_np - b) ** 2) + c
+            continue
+
+        # 默认（以及正则化场景）都按 sigmoid 处理
         exp_arg = np.clip(-b * (s_grid_np - c), -50.0, 50.0)
         y_on_grid[:, k] = a / (1.0 + np.exp(exp_arg)) + d
     return y_on_grid
 
 
-def get_sigmoid_y_dyds_tensor(s_tensor: torch.Tensor, sigmoid_params, device=None):
+def get_sigmoid_y_dyds_tensor(s_tensor: torch.Tensor, sigmoid_params, device=None, force_sigmoid_for_c=True):
     """
-    torch版：给定 s (Ns,) 返回 sigmoid 的 y(s) 与 dy/ds(s)
-    sigmoid: y = a/(1+exp(-b(s-c))) + d
-    dy/ds = a*b*exp(-b(s-c)) / (1+exp(-b(s-c)))^2
-
-    s_tensor: (Ns,) float tensor
-    sigmoid_params: (4,4) array/list -> [a,b,c,d] for each biomarker
-    return:
-      y: (Ns,4)
-      dyds: (Ns,4)
+    torch版：给定 s (Ns,) 返回 y(s) 与 dy/ds(s)
+    - 默认（以及主程序正则化）按 sigmoid 计算全部4个biomarker；
+    - 若 force_sigmoid_for_c=False 且 C参数为非sigmoid（d非有限），
+      则 C 使用二次函数 y=a(s-b)^2+c, dy/ds=2a(s-b)。
     """
     if device is None:
         device = s_tensor.device
     sig = torch.tensor(sigmoid_params, dtype=torch.get_default_dtype(), device=device)  # (4,4)
-    a = sig[:, 0].view(1, 4)
-    b = sig[:, 1].view(1, 4)
-    c = sig[:, 2].view(1, 4)
-    d = sig[:, 3].view(1, 4)
 
     s = s_tensor.view(-1, 1)  # (Ns,1)
-    exp_term = torch.exp(-b * (s - c))
-    denom = (1.0 + exp_term)
-    y = a / denom + d
-    dyds = (a * b * exp_term) / (denom ** 2)
+    y = torch.zeros((s.shape[0], 4), dtype=torch.get_default_dtype(), device=device)
+    dyds = torch.zeros_like(y)
+
+    for k in range(4):
+        a = sig[k, 0]
+        b = sig[k, 1]
+        c = sig[k, 2]
+        d = sig[k, 3]
+
+        use_quad_c = (k == 3) and (not torch.isfinite(d)) and (not force_sigmoid_for_c)
+        if use_quad_c:
+            y[:, k] = a * ((s[:, 0] - b) ** 2) + c
+            dyds[:, k] = 2.0 * a * (s[:, 0] - b)
+        else:
+            exp_term = torch.exp(-b * (s[:, 0] - c))
+            denom = (1.0 + exp_term)
+            y[:, k] = a / denom + d
+            dyds[:, k] = (a * b * exp_term) / (denom ** 2)
+
     return y, dyds
 
 
@@ -208,9 +220,9 @@ def get_stage_mean_y(patient_data, stage, fallback_tensor):
 
 def build_s_grid_from_dps(dps_params_loaded, patient_data, margin_ratio=0.1, num_points=500):
     """
-    固定 s_grid 范围：从 -20 到 30，间隔 0.01
+    固定 s_grid 范围：从 -10 到 30，间隔 0.01
     """
-    s_grid_np = np.arange(-20.0, 30.0, 1.0)
+    s_grid_np = np.arange(-10.0, 30.0, 1.0)
     return s_grid_np
 
 
@@ -615,13 +627,11 @@ if __name__ == '__main__':
     print("\n--- 初始化 FNN 模型 ---")
     fnn_pretrained = FNN(input_dim=4, hidden_dim=128, output_dim=4).to(device)
 
-    # 加载预训练模型参数
-    try:
-        fnn_pretrained.load_state_dict(torch.load('pretrain.pth', map_location=device, weights_only=False))
-        print("成功加载 pretrain.pth")
-    except FileNotFoundError:
-        print("错误: 未找到 pretrain.pth，请先运行 pretrain.py")
-        exit()
+    # 不加载 pretrain，直接正态分布初始化：N(0, 0.01)
+    with torch.no_grad():
+        for p in fnn_pretrained.parameters():
+            nn.init.normal_(p, mean=0.0, std=0.01)
+    print("已使用 N(0, 0.01) 完成模型参数初始化。")
 
     # 加载sigmoid参数与DPS参数
     try:
@@ -735,7 +745,7 @@ if __name__ == '__main__':
         y_sigmoid_np = get_sigmoid_values(sigmoid_params, s_grid.numpy())
         y_sigmoid_orig = pc.inv_nor(y_sigmoid_np)
         
-        TITLES = ['Aβ (A)', 'p-Tau (T)', 'N', 'Cognition (C)']
+        TITLES = ['Aβ (A)', 'Tau (T)', 'N', 'Cognition (C)']
         colors = {'CN': 'orange', 'LMCI': 'green', 'AD': 'blue', 'Other': 'grey'}
         
         fig, axes = plt.subplots(2, 2, figsize=(14, 11))
