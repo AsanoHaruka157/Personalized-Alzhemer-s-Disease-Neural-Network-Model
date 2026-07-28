@@ -1,28 +1,63 @@
+"""
+Sigmoid curve fitting for AD biomarker trajectories.
+
+This script fits regularized sigmoid curves to the four key Alzheimer's disease
+biomarkers (Aβ, p-Tau, N, Cognition) across the disease progression score (s).
+It also assigns initial DPS (Disease Progression Score) transformation parameters
+to each patient based on their diagnostic stage.
+
+This is the first stage of the experimental pipeline: sigmoid fitting provides
+the target trajectories that the FNN-based Neural ODE will later learn to reproduce.
+
+Outputs:
+  - sigmoid.pth: fitted sigmoid parameters (4 biomarkers x 4 params each)
+  - dps.pth: per-patient DPS transformation parameters (a, b)
+  - sigmoid.png: visualization of fitted sigmoid curves against patient data
+"""
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
-import pccmnn as pc  # 假设您有这个文件来加载和反归一化数据
+import pccmnn as pc
 
-# --- 0. 数据加载和准备 ---
+
+# ==============================================================================
+# 0. Data loading
+# ==============================================================================
 csf_dict = pc.load_data()
 stage_dict = pc.load_stage_dict()
-print(f"成功加载 {len(csf_dict)} 位患者的数据。")
+print(f"Successfully loaded data for {len(csf_dict)} patients.")
 
-# --- 1. 为每位患者分配DPS变换参数（可优化版本）---
+
+# ==============================================================================
+# 1. DPS parameter assignment
+# ==============================================================================
 def assign_dps_params(csf_dict, stage_dict):
-    """
-    为每位患者创建可优化的DPS变换参数 a 和 b。
-    a: CN=1, LMCI=2, AD=4 的初始值，但可优化
-    b: 随机初始化，但可优化
+    """Assign initial (optimizable) DPS transformation parameters per patient.
+
+    The DPS transformation maps calendar time t to disease progression score s:
+        s = a * t + b
+
+    Initial values are set based on diagnostic stage:
+      - CN:    a=1.0, s in [-10, 0]
+      - LMCI:  a=2.0, s in [-2, 8]
+      - AD:    a=4.0, s in [5, 20]
+      - Other: a=1.0, s in [-10, 20]
+
+    Args:
+        csf_dict: Patient biomarker data dictionary.
+        stage_dict: Patient diagnostic stage dictionary.
+
+    Returns:
+        dict: {pid: {'a': nn.Parameter, 'b': nn.Parameter, 'stage': str}}
     """
     s_ranges = {
         'CN': (-10, 0),
         'LMCI': (-2, 8),
         'AD': (5, 20),
-        'Other': (-10, 20)
+        'Other': (-10, 20),
     }
     a_init_values = {'CN': 1.0, 'LMCI': 2.0, 'AD': 4.0, 'Other': 1.0}
 
@@ -46,8 +81,14 @@ def assign_dps_params(csf_dict, stage_dict):
 
 
 def compute_s_values(csf_dict, dps_params):
-    """
-    根据当前的DPS参数计算所有患者的s值
+    """Compute disease progression scores (s) for all patients using current DPS params.
+
+    Args:
+        csf_dict: Patient biomarker data dictionary.
+        dps_params: DPS parameters per patient.
+
+    Returns:
+        tuple: (patient_data, s_population, y_population, all_stages)
     """
     patient_data = {}
     all_s_points = []
@@ -71,7 +112,7 @@ def compute_s_values(csf_dict, dps_params):
             's': s.detach().numpy(),
             'stage': stage,
             'a': a.item(),
-            'b': b.item()
+            'b': b.item(),
         }
 
         all_s_points.append(s.detach().numpy())
@@ -84,9 +125,17 @@ def compute_s_values(csf_dict, dps_params):
     return patient_data, s_population, y_population, all_stages
 
 
+# ==============================================================================
+# 2. Population statistics
+# ==============================================================================
 def get_cn_average_y0(patient_data):
-    """
-    计算CN（认知正常）群体在第一次访问时的平均生物标记物值（忽略NaN）。
+    """Compute the average baseline biomarker values for cognitively normal (CN) subjects.
+
+    Args:
+        patient_data: Dictionary of per-patient data with 'stage' and 'y' keys.
+
+    Returns:
+        np.ndarray: Average initial biomarker values [Aβ, Tau, N, C] (normalized).
     """
     cn_y0s = []
     for pid, data in patient_data.items():
@@ -94,20 +143,25 @@ def get_cn_average_y0(patient_data):
             cn_y0s.append(data['y'][0])
 
     if not cn_y0s:
-        print("警告：未找到CN患者数据，将使用默认初始值 [0.1, 0, 0, 0]。")
+        print("Warning: No CN patients found. Using default y0 = [0.1, 0, 0, 0].")
         return np.array([0.1, 0.0, 0.0, 0.0])
 
     cn_y0s_array = np.array(cn_y0s)
     avg_y0 = np.nanmean(cn_y0s_array, axis=0)
     avg_y0 = np.nan_to_num(avg_y0, nan=0.0)
 
-    print(f"计算出的CN群体平均初始值（非NaN，归一化后）: {avg_y0}")
+    print(f"CN population average initial values (normalized): {avg_y0}")
     return avg_y0
 
 
 def get_cn_average_s0(patient_data):
-    """
-    计算CN群体第一次访问对应的平均s值。
+    """Compute the average initial disease progression score for CN subjects.
+
+    Args:
+        patient_data: Dictionary of per-patient data.
+
+    Returns:
+        float: Average initial s value for CN patients.
     """
     cn_s0s = []
     for pid, data in patient_data.items():
@@ -115,21 +169,26 @@ def get_cn_average_s0(patient_data):
             cn_s0s.append(data['s'][0])
 
     if not cn_s0s:
-        print("警告：未找到CN患者s0，将使用默认s0=0.0。")
+        print("Warning: No CN patients found. Using default s0 = 0.0.")
         return 0.0
 
     avg_s0 = float(np.nanmean(np.array(cn_s0s)))
     if np.isnan(avg_s0):
-        print("警告：CN s0均为NaN，将使用默认s0=0.0。")
+        print("Warning: All CN s0 values are NaN. Using default s0 = 0.0.")
         return 0.0
 
-    print(f"计算出的CN群体平均s0: {avg_s0}")
+    print(f"CN population average s0: {avg_s0}")
     return avg_s0
 
 
 def get_ad_average_y(patient_data):
-    """
-    计算AD群体所有时间点的平均生物标记物值（忽略NaN）。
+    """Compute the average biomarker values across all visits for AD subjects.
+
+    Args:
+        patient_data: Dictionary of per-patient data.
+
+    Returns:
+        np.ndarray: Average biomarker values [Aβ, Tau, N, C] (normalized).
     """
     ad_ys = []
     for pid, data in patient_data.items():
@@ -137,20 +196,25 @@ def get_ad_average_y(patient_data):
             ad_ys.append(data['y'])
 
     if not ad_ys:
-        print("警告：未找到AD患者数据，将使用默认值 [0.0, 0.0, 0.0, 0.0]。")
+        print("Warning: No AD patients found. Using default values [0, 0, 0, 0].")
         return np.array([0.0, 0.0, 0.0, 0.0])
 
     ad_ys_array = np.concatenate(ad_ys, axis=0)
     avg_y = np.nanmean(ad_ys_array, axis=0)
     avg_y = np.nan_to_num(avg_y, nan=0.0)
 
-    print(f"计算出的AD群体平均值（非NaN，归一化后）: {avg_y}")
+    print(f"AD population average values (normalized): {avg_y}")
     return avg_y
 
 
 def get_ad_average_y_final(patient_data):
-    """
-    计算AD群体“最终一次访问”的平均生物标记物值（忽略NaN）。
+    """Compute the average *final visit* biomarker values for AD subjects.
+
+    Args:
+        patient_data: Dictionary of per-patient data.
+
+    Returns:
+        np.ndarray: Average final-visit biomarker values [Aβ, Tau, N, C] (normalized).
     """
     ad_y_final = []
     for _, data in patient_data.items():
@@ -158,27 +222,60 @@ def get_ad_average_y_final(patient_data):
             ad_y_final.append(data['y'][-1])
 
     if not ad_y_final:
-        print("警告：未找到AD患者最终值，将使用默认值 [0.0, 0.0, 0.0, 0.0]。")
+        print("Warning: No AD patients found. Using default values [0, 0, 0, 0].")
         return np.array([0.0, 0.0, 0.0, 0.0])
 
     ad_y_final = np.array(ad_y_final)
     avg_y_final = np.nanmean(ad_y_final, axis=0)
     avg_y_final = np.nan_to_num(avg_y_final, nan=0.0)
 
-    print(f"计算出的AD群体平均最终值（非NaN，归一化后）: {avg_y_final}")
+    print(f"AD population average final values (normalized): {avg_y_final}")
     return avg_y_final
 
 
-# --- 2. Sigmoid模型（使用scipy优化 + 正则约束）---
-
+# ==============================================================================
+# 3. Sigmoid model and regularized fitting
+# ==============================================================================
 def sigmoid(s, a, b, c, d):
+    """Generalized sigmoid (logistic) function.
+
+    y(s) = a / (1 + exp(-b * (s - c))) + d
+
+    Args:
+        s: Input disease progression score(s).
+        a: Amplitude (vertical scale).
+        b: Slope / steepness (sign determines direction).
+        c: Center / inflection point.
+        d: Vertical offset (lower asymptote).
+
+    Returns:
+        Function value(s) at s.
+    """
     exp_arg = np.clip(-b * (s - c), -50.0, 50.0)
     exp_term = np.exp(exp_arg)
-    y = a / (1.0 + exp_term) + d
-    return y
+    return a / (1.0 + exp_term) + d
 
 
 def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
+    """Compute regularized residuals for scipy least_squares optimization.
+
+    Combines data-fitting residuals with penalty terms that enforce:
+      - Platform values near CN (upper) and AD (lower) population averages
+      - Inflection point (c) in [0, 10]
+      - Curvature (|b|) in [target_b_abs, target_b_max]
+      - Amplitude (|a|) <= target_amp_max
+      - Curve passes through two target anchor points
+      - Turning points within desired range
+
+    Args:
+        params: [a, b, c, d] sigmoid parameters.
+        s_valid: Valid s values (1D array).
+        y_valid: Valid y values (1D array).
+        reg_cfg: Regularization configuration dictionary.
+
+    Returns:
+        np.ndarray: Concatenated [data_residuals, regularization_terms].
+    """
     a, b, c, d = params
 
     y_pred = sigmoid(s_valid, a, b, c, d)
@@ -193,7 +290,7 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     target_b_max = reg_cfg['target_b_max']
     target_amp_max = reg_cfg['target_amp_max']
 
-    # 让曲线经过两个指定点 (s_target_1, y_target_1), (s_target_2, y_target_2)
+    # Anchor points: curve should pass through (s_target, y_target)
     s_target_1 = reg_cfg.get('s_target_1', reg_cfg.get('s_target', 0.0))
     y_target_1 = reg_cfg.get('y_target_1', reg_cfg.get('y_target', 0.0))
     s_target_2 = reg_cfg.get('s_target_2', 30.0)
@@ -201,7 +298,7 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     pass_pen_1 = (sigmoid(s_target_1, a, b, c, d) - y_target_1) * np.sqrt(w_cn)
     pass_pen_2 = (sigmoid(s_target_2, a, b, c, d) - y_target_2) * np.sqrt(w_cn)
 
-    # 上/下平台接近 CN 与 AD 平均值
+    # Platform penalties: upper ~ CN average, lower ~ AD average
     y_cn = reg_cfg.get('y_cn', 0.0)
     y_ad = reg_cfg.get('y_ad', 0.0)
     upper = np.maximum(d, d + a)
@@ -210,18 +307,18 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     plat_pen_upper = (upper - y_cn) * np.sqrt(w_plat) if use_plat_upper else 0.0
     plat_pen_lower = (lower - y_ad) * np.sqrt(w_plat)
 
-    # 中心点在[0,10]内
+    # Center in [0, 10]
     center_low = max(0.0, -c) * np.sqrt(w_center)
     center_high = max(0.0, c - 10.0) * np.sqrt(w_center)
 
-    # 控制曲率：|b| 处于 [target_b_abs, target_b_max]
+    # Curvature bounds: target_b_abs <= |b| <= target_b_max
     curv_pen_low = max(0.0, target_b_abs - np.abs(b)) * np.sqrt(w_curv)
     curv_pen_high = max(0.0, np.abs(b) - target_b_max) * np.sqrt(w_curv)
 
-    # 幅度不要过大：|a| <= target_amp_max
+    # Amplitude cap
     amp_pen = max(0.0, np.abs(a) - target_amp_max) * np.sqrt(w_curv)
 
-    # 仍保留"两个拐点"约束
+    # Turning point constraints
     b_safe = b if np.abs(b) > 1e-6 else 1e-6
     turn_left = c - (np.log(2.0) / b_safe)
     turn_right = c + (np.log(2.0) / b_safe)
@@ -230,23 +327,25 @@ def _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg):
     turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn) if use_turn_right else 0.0
 
     reg_terms = np.array([
-        turn_pen_left,
-        turn_pen_right,
-        center_low,
-        center_high,
-        curv_pen_low,
-        curv_pen_high,
-        amp_pen,
-        pass_pen_1,
-        pass_pen_2,
-        plat_pen_upper,
-        plat_pen_lower
+        turn_pen_left, turn_pen_right, center_low, center_high,
+        curv_pen_low, curv_pen_high, amp_pen,
+        pass_pen_1, pass_pen_2, plat_pen_upper, plat_pen_lower,
     ])
 
     return np.concatenate([residuals, reg_terms])
 
 
 def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
+    """Compute scalar loss for sigmoid fitting (MSE of residuals + regularization).
+
+    Args:
+        params: [a, b, c, d].
+        s_valid, y_valid: Valid data points.
+        reg_cfg: Regularization config.
+
+    Returns:
+        float: Scalar loss value.
+    """
     a, b, c, d = params
     y_pred = sigmoid(s_valid, a, b, c, d)
     residuals = y_pred - y_valid
@@ -259,7 +358,6 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     target_b_abs = reg_cfg['target_b_abs']
     target_b_max = reg_cfg.get('target_b_max', 0.9)
 
-    # 让曲线经过两个指定点 (s_target_1, y_target_1), (s_target_2, y_target_2)
     s_target_1 = reg_cfg.get('s_target_1', reg_cfg.get('s_target', 0.0))
     y_target_1 = reg_cfg.get('y_target_1', reg_cfg.get('y_target', 0.0))
     s_target_2 = reg_cfg.get('s_target_2', 20.0)
@@ -267,7 +365,6 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     pass_pen_1 = (sigmoid(s_target_1, a, b, c, d) - y_target_1) * np.sqrt(w_cn)
     pass_pen_2 = (sigmoid(s_target_2, a, b, c, d) - y_target_2) * np.sqrt(w_cn)
 
-    # 上/下平台接近 CN 与 AD 平均值
     y_cn = reg_cfg.get('y_cn', 0.0)
     y_ad = reg_cfg.get('y_ad', 0.0)
     upper = np.maximum(d, d + a)
@@ -276,15 +373,12 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     plat_pen_upper = (upper - y_cn) * np.sqrt(w_plat) if use_plat_upper else 0.0
     plat_pen_lower = (lower - y_ad) * np.sqrt(w_plat)
 
-    # 中心点在[0,10]内
     center_low = max(0.0, -c) * np.sqrt(w_center)
     center_high = max(0.0, c - 10.0) * np.sqrt(w_center)
 
-    # 控制曲率：|b| 处于 [target_b_abs, target_b_max]
     curv_pen_low = max(0.0, target_b_abs - np.abs(b)) * np.sqrt(w_curv)
     curv_pen_high = max(0.0, np.abs(b) - target_b_max) * np.sqrt(w_curv)
 
-    # 仍保留"两个拐点"约束
     b_safe = b if np.abs(b) > 1e-6 else 1e-6
     turn_left = c - (np.log(2.0) / b_safe)
     turn_right = c + (np.log(2.0) / b_safe)
@@ -293,46 +387,47 @@ def _sigmoid_fit_loss(params, s_valid, y_valid, reg_cfg):
     turn_pen_right = (turn_right - 10.0) * np.sqrt(w_turn) if use_turn_right else 0.0
 
     reg_terms = np.array([
-        turn_pen_left,
-        turn_pen_right,
-        center_low,
-        center_high,
-        curv_pen_low,
-        curv_pen_high,
-        pass_pen_1,
-        pass_pen_2,
-        plat_pen_upper,
-        plat_pen_lower
+        turn_pen_left, turn_pen_right, center_low, center_high,
+        curv_pen_low, curv_pen_high, pass_pen_1, pass_pen_2,
+        plat_pen_upper, plat_pen_lower,
     ])
     all_res = np.concatenate([residuals, reg_terms])
     return float(np.mean(all_res ** 2))
 
 
 def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
-    """
-    拟合4个biomarker轨迹：
-    - k=0,1,2 使用 sigmoid + 正则约束
-    - k=3 (C) 使用二次函数（无额外正则）
+    """Fit regularized sigmoid curves to each of the 4 biomarkers.
+
+    Biomarker-specific adjustments:
+      - k=1 (Tau): fixed upper/lower platforms (a+d=130, d=70 in original space),
+        stronger curvature constraints.
+      - k=3 (Cognition): no upper platform or right turning point constraints.
+
+    Args:
+        s_data: Disease progression scores (N,).
+        y_data: Biomarker values (N, 4), normalized.
+        reg_cfg: Regularization configuration dictionary.
+
+    Returns:
+        tuple: (sigmoid_params (4, 4), total_loss (float))
     """
     def _tau_bc_residuals(x_bc, s_valid, y_valid, reg_cfg_k, fixed_a, fixed_d):
+        """Residuals for Tau with fixed amplitude and offset."""
         b, c = x_bc
         params = np.array([fixed_a, b, c, fixed_d], dtype=np.float64)
         return _sigmoid_regularized_residuals(params, s_valid, y_valid, reg_cfg_k)
 
     if reg_cfg is None:
         reg_cfg = {
-            'w_turn': 5.0,
-            'w_center': 2.0,
-            'w_curv': 5.0,
-            'w_cn': 8.0,
-            'w_plat': 6.0,
-            'target_b_abs': 0.9,
-            'target_b_max': 1.2,
-            'target_amp_max': 4.0
+            'w_turn': 5.0, 'w_center': 2.0, 'w_curv': 5.0,
+            'w_cn': 8.0, 'w_plat': 6.0,
+            'target_b_abs': 0.9, 'target_b_max': 1.2,
+            'target_amp_max': 4.0,
         }
 
     sigmoid_params = []
     total_loss = 0.0
+
     for k in range(4):
         y_k = y_data[:, k]
         valid_mask = ~np.isnan(y_k)
@@ -344,21 +439,26 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
         y_ad = reg_cfg.get('y_ad', 0.0)
         reg_cfg_k['y_cn'] = y_cn[k] if isinstance(y_cn, (list, np.ndarray)) else y_cn
         reg_cfg_k['y_ad'] = y_ad[k] if isinstance(y_ad, (list, np.ndarray)) else y_ad
+
         y_target_1 = reg_cfg.get('y_target_1', reg_cfg.get('y_target', 0.0))
-        reg_cfg_k['y_target_1'] = y_target_1[k] if isinstance(y_target_1, (list, np.ndarray)) else y_target_1
+        reg_cfg_k['y_target_1'] = (y_target_1[k]
+                                   if isinstance(y_target_1, (list, np.ndarray))
+                                   else y_target_1)
         reg_cfg_k['s_target_1'] = reg_cfg.get('s_target_1', reg_cfg.get('s_target', -20.0))
 
         y_target_2 = reg_cfg.get('y_target_2', y_ad)
-        reg_cfg_k['y_target_2'] = y_target_2[k] if isinstance(y_target_2, (list, np.ndarray)) else y_target_2
+        reg_cfg_k['y_target_2'] = (y_target_2[k]
+                                   if isinstance(y_target_2, (list, np.ndarray))
+                                   else y_target_2)
         reg_cfg_k['s_target_2'] = reg_cfg.get('s_target_2', 20.0)
 
-        # Tau(k=1): 固定上下平台，仅优化 b,c，并使用指定曲率约束
+        # Tau (k=1): fix platform, stronger curvature
         if k == 1:
             reg_cfg_k['target_b_abs'] = 2.5
             reg_cfg_k['target_b_max'] = 3.0
             reg_cfg_k['w_curv'] = 100
 
-        # C(k=3): 不做上平台约束，也不做右拐点约束
+        # Cognition (k=3): no upper platform or right-turning-point constraints
         if k == 3:
             reg_cfg_k['use_plat_upper'] = False
             reg_cfg_k['use_turn_right'] = False
@@ -368,7 +468,6 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
             sigmoid_params.append(default_params)
             total_loss += _sigmoid_fit_loss(default_params, s_k_valid, y_k_valid, reg_cfg_k)
             continue
-
 
         amp_init = np.max(y_k_valid) - np.min(y_k_valid)
         center_init = np.median(s_k_valid)
@@ -385,7 +484,7 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
                 _tau_bc_residuals,
                 x0=x0_bc,
                 args=(s_k_valid, y_k_valid, reg_cfg_k, fixed_a, fixed_d),
-                max_nfev=10000
+                max_nfev=10000,
             )
             b_opt, c_opt = result.x
             params_opt = np.array([fixed_a, b_opt, c_opt, fixed_d], dtype=np.float64)
@@ -395,7 +494,7 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
                 _sigmoid_regularized_residuals,
                 x0=p0,
                 args=(s_k_valid, y_k_valid, reg_cfg_k),
-                max_nfev=10000
+                max_nfev=10000,
             )
             params_opt = result.x
 
@@ -405,10 +504,24 @@ def fit_sigmoids_regularized(s_data, y_data, reg_cfg=None):
     return np.array(sigmoid_params), float(total_loss)
 
 
-# --- 3. 训练DPS参数（逻辑不变，仅使用sigmoid作为拟合目标）---
-# --- 3. 仅Sigmoid训练 ---
+# ==============================================================================
+# 4. Sigmoid-only training pipeline
+# ==============================================================================
 def train_sigmoid_only(csf_dict, stage_dict):
-    print("\n开始仅Sigmoid训练（不拟合DPS参数）...")
+    """Train sigmoid curves without fitting DPS parameters.
+
+    Uses initial DPS parameter assignment and fits regularized sigmoid curves
+    to all four biomarkers. Tau is constrained with fixed platforms
+    (original space: d=70, a+d=130).
+
+    Args:
+        csf_dict: Patient biomarker data.
+        stage_dict: Patient diagnostic stages.
+
+    Returns:
+        tuple: (dps_params, sigmoid_params)
+    """
+    print("\nStarting sigmoid-only training (no DPS optimization)...")
     dps_params = assign_dps_params(csf_dict, stage_dict)
 
     patient_data, s_pop, y_pop_norm, _ = compute_s_values(csf_dict, dps_params)
@@ -416,8 +529,8 @@ def train_sigmoid_only(csf_dict, stage_dict):
     y_ad = get_ad_average_y(patient_data)
     y_ad_final = get_ad_average_y_final(patient_data)
 
-    # Tau约束：固定上下平台 a+d=130, d=70（先转归一化）
-    mean_std = np.load('mean_std.npy')
+    # Tau fixed-platform constraint: original-space targets
+    mean_std = np.load('../data/mean_std.npy')
     tau_mean = float(mean_std[0, 1])
     tau_std = float(mean_std[1, 1])
     tau_lower_norm = (70.0 - tau_mean) / tau_std
@@ -428,61 +541,72 @@ def train_sigmoid_only(csf_dict, stage_dict):
     y_target_1[1] = tau_lower_norm
     y_target_2[1] = tau_upper_norm
 
-    print("Tau固定平台(原空间): d=70, a+d=130")
-    print(f"Tau固定平台(归一化): d={tau_lower_norm:.6f}, a+d={tau_upper_norm:.6f}")
+    print("Tau fixed platforms (original space): d=70, a+d=130")
+    print(f"Tau fixed platforms (normalized): d={tau_lower_norm:.6f}, a+d={tau_upper_norm:.6f}")
 
     sigmoid_params, sigmoid_loss = fit_sigmoids_regularized(
-        s_pop,
-        y_pop_norm,
+        s_pop, y_pop_norm,
         reg_cfg={
-            'w_turn': 5.0,
-            'w_center': 2.0,
-            'w_curv': 3.0,
-            'w_cn': 10.0,
-            'w_plat': 8.0,
-            'target_b_abs': 0.6,
-            'target_b_max': 0.9,
+            'w_turn': 5.0, 'w_center': 2.0, 'w_curv': 3.0,
+            'w_cn': 10.0, 'w_plat': 8.0,
+            'target_b_abs': 0.6, 'target_b_max': 0.9,
             'target_amp_max': 2.0,
-            's_target_1': -20.0,
-            'y_target_1': y_target_1,
-            's_target_2': 30.0,
-            'y_target_2': y_target_2,
+            's_target_1': -20.0, 'y_target_1': y_target_1,
+            's_target_2': 30.0, 'y_target_2': y_target_2,
             'tau_fix_platform': True,
             'tau_lower_norm': tau_lower_norm,
             'tau_upper_norm': tau_upper_norm,
-            'c_quad_b_fixed': -10.0,
-            'c_quad_c_fixed': float(y0_cn[3]),
-            'y_cn': y0_cn,
-            'y_ad': y_ad
-        }
+            'y_cn': y0_cn, 'y_ad': y_ad,
+        },
     )
 
-    torch.save(sigmoid_params, 'sigmoid.pth')
-    print(f"Sigmoid训练完成，Loss: {sigmoid_loss:.6f}")
+    torch.save(sigmoid_params, '../models/sigmoid.pth')
+    print(f"Sigmoid training complete. Loss: {sigmoid_loss:.6f}")
 
     return dps_params, sigmoid_params
 
 
-# --- 5. 绘图 ---
+# ==============================================================================
+# 5. Visualization
+# ==============================================================================
 def get_sigmoid_derivatives(s_grid, params):
+    """Evaluate sigmoid curves and their derivatives on a grid.
+
+    Args:
+        s_grid: 1D array of s values.
+        params: (4, 4) array of sigmoid parameters per biomarker.
+
+    Returns:
+        tuple: (y_on_grid (N, 4), dyds_on_grid (N, 4))
+    """
     y_on_grid = np.zeros((len(s_grid), 4))
     dyds_on_grid = np.zeros((len(s_grid), 4))
 
     for k in range(4):
         a, b, c, d = params[k]
-
-
         exp_arg = np.clip(-b * (s_grid - c), -50.0, 50.0)
         exp_term = np.exp(exp_arg)
         denom = (1.0 + exp_term) ** 2
         y_on_grid[:, k] = a / (1.0 + exp_term) + d
-        dyds_on_grid[:, k] = np.divide(a * b * exp_term, denom, out=np.zeros_like(exp_term), where=denom != 0)
+        dyds_on_grid[:, k] = np.divide(
+            a * b * exp_term, denom,
+            out=np.zeros_like(exp_term), where=denom != 0,
+        )
 
     return y_on_grid, dyds_on_grid
 
 
 def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params):
-    print("正在生成最终结果图...")
+    """Plot sigmoid-fitted curves against patient data for all 4 biomarkers.
+
+    Args:
+        s_pop: Population s values.
+        y_pop: Population y values (normalized).
+        stages_pop: Diagnostic stages for each data point.
+        s_grid: s-axis grid for plotting curves.
+        sigmoid_params: Fitted sigmoid parameters.
+    """
+    print("Generating final result figure...")
 
     y_pop_orig = pc.inv_nor(y_pop)
     y_sigmoid_grid_norm, _ = get_sigmoid_derivatives(s_grid, sigmoid_params)
@@ -504,9 +628,11 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params):
         ax = axes[k]
         for stage in unique_stages:
             s_vals, y_vals = scatter_data[stage]
-            ax.scatter(s_vals, y_vals[:, k], s=15, alpha=0.5, c=colors[stage], label=stage)
+            ax.scatter(s_vals, y_vals[:, k], s=15, alpha=0.5,
+                       c=colors[stage], label=stage)
 
-        ax.plot(s_grid, y_sigmoid_grid_orig[:, k], 'r-', lw=2.5, label='Sigmoid Fit', zorder=3)
+        ax.plot(s_grid, y_sigmoid_grid_orig[:, k], 'r-', lw=2.5,
+                label='Sigmoid Fit', zorder=3)
 
         ax.set_xlabel('Disease Progression Score (s)')
         ax.set_ylabel(TITLES[k])
@@ -517,44 +643,43 @@ def plot_results(s_pop, y_pop, stages_pop, s_grid, sigmoid_params):
 
     fig.suptitle('AD Biomarker Trajectories: Sigmoid Fit', fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig('sigmoid.png')
+    plt.savefig('../figures/sigmoid.png')
     plt.show()
 
 
+# ==============================================================================
+# Main
+# ==============================================================================
 if __name__ == '__main__':
-    print("开始预训练流程...")
+    print("Starting pretraining pipeline...")
 
-    # 1. 仅训练sigmoid（不拟合DPS参数）
-    dps_params, _ = train_sigmoid_only(
-        csf_dict,
-        stage_dict
-    )
+    # 1. Train sigmoid curves (no DPS optimization)
+    dps_params, _ = train_sigmoid_only(csf_dict, stage_dict)
 
-    # 保存DPS参数（固定版本）
+    # Save initial DPS parameters
     dps_save = {
-        pid: {
-            'a': params['a'].item(),
-            'b': params['b'].item()
-        }
+        pid: {'a': params['a'].item(), 'b': params['b'].item()}
         for pid, params in dps_params.items()
     }
-    torch.save(dps_save, 'dps.pth')
-    print("已保存DPS参数到 dps.pth")
+    torch.save(dps_save, '../models/dps.pth')
+    print("DPS parameters saved to dps.pth")
 
-    # 2. 读取最优sigmoid参数
-    print("读取最优sigmoid参数...")
-    sigmoid_params = torch.load('sigmoid.pth', weights_only=False)
+    # 2. Load optimal sigmoid parameters
+    print("Loading optimal sigmoid parameters...")
+    sigmoid_params = torch.load('../models/sigmoid.pth', weights_only=False)
 
-    # 3. 计算最终s值与患者数据
-    print("计算最终s值...")
-    patient_data, s_pop, y_pop_norm, stages_pop = compute_s_values(csf_dict, dps_params)
+    # 3. Compute final s values and patient data
+    print("Computing final s values...")
+    patient_data, s_pop, y_pop_norm, stages_pop = compute_s_values(
+        csf_dict, dps_params,
+    )
 
-    # 4. 计算CN群体平均初始值（如需后续使用）
-    print("计算CN群体平均初始值...")
+    # 4. Compute CN population average initial values
+    print("Computing CN population average initial values...")
     _ = get_cn_average_y0(patient_data)
 
-    # 5. 绘图
-    print("生成结果图表...")
+    # 5. Plot results
+    print("Generating result figure...")
     s_min, s_max = s_pop.min(), s_pop.max()
     s_margin = (s_max - s_min) * 0.1
     s_grid = np.linspace(s_min - s_margin, s_max + s_margin, 300)
